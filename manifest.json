@@ -1,0 +1,333 @@
+{
+  "version": "1.0.0",
+  "bridge": {
+    "routes": [
+      {
+        "name": "status",
+        "params": {},
+        "output": {
+          "variable": "glassesStatus",
+          "callback": "onGlassesStatus"
+        }
+      },
+      {
+        "name": "register",
+        "params": {},
+        "timeout_ms": 25000,
+        "output": {
+          "variable": "glassesRegister",
+          "callback": "onGlassesRegister"
+        }
+      },
+      {
+        "name": "unregister",
+        "params": {},
+        "timeout_ms": 25000,
+        "output": {
+          "variable": "glassesUnregister",
+          "callback": "onGlassesUnregister"
+        }
+      },
+      {
+        "name": "permission",
+        "params": {
+          "prompt": {
+            "type": "bool"
+          }
+        },
+        "timeout_ms": 25000,
+        "output": {
+          "variable": "glassesPermission",
+          "callback": "onGlassesPermission"
+        }
+      },
+      {
+        "name": "start",
+        "params": {
+          "quality": {
+            "type": "enum",
+            "values": [
+              "low",
+              "medium",
+              "high"
+            ]
+          },
+          "fps": {
+            "type": "int",
+            "min": 2,
+            "max": 30
+          }
+        },
+        "timeout_ms": 25000,
+        "output": {
+          "variable": "glassesStart",
+          "callback": "onGlassesStart"
+        }
+      },
+      {
+        "name": "stop",
+        "params": {},
+        "output": {
+          "variable": "glassesStop",
+          "callback": "onGlassesStop"
+        }
+      },
+      {
+        "name": "photo",
+        "params": {},
+        "timeout_ms": 25000,
+        "output": {
+          "variable": "glassesPhoto",
+          "callback": "onGlassesPhoto"
+        }
+      },
+      {
+        "name": "record_start",
+        "params": {
+          "seconds": {
+            "type": "int",
+            "min": 1,
+            "max": 60,
+            "required": true
+          }
+        },
+        "output": {
+          "variable": "glassesRecordStart",
+          "callback": "onGlassesRecordStart"
+        }
+      },
+      {
+        "name": "record_stop",
+        "params": {},
+        "timeout_ms": 25000,
+        "output": {
+          "variable": "glassesRecordStop",
+          "callback": "onGlassesRecordStop"
+        }
+      },
+      {
+        "name": "frame",
+        "params": {},
+        "output": {
+          "variable": "glassesFrame",
+          "callback": "onGlassesFrame"
+        }
+      },
+      {
+        "name": "media",
+        "params": {},
+        "output": {
+          "variable": "glassesMediaList",
+          "callback": "onGlassesMediaList"
+        }
+      },
+      {
+        "name": "media_read",
+        "params": {
+          "id": {
+            "type": "string",
+            "max": 32,
+            "required": true
+          },
+          "kind": {
+            "type": "enum",
+            "values": [
+              "jpg",
+              "mp4"
+            ],
+            "required": true
+          },
+          "chunk": {
+            "type": "int",
+            "min": 0,
+            "max": 4096
+          }
+        },
+        "output": {
+          "variable": "glassesMediaRead",
+          "callback": "onGlassesMediaRead"
+        }
+      },
+      {
+        "name": "media_delete",
+        "params": {
+          "id": {
+            "type": "string",
+            "max": 32,
+            "required": true
+          },
+          "kind": {
+            "type": "enum",
+            "values": [
+              "jpg",
+              "mp4"
+            ],
+            "required": true
+          }
+        },
+        "output": {
+          "variable": "glassesMediaDelete",
+          "callback": "onGlassesMediaDelete"
+        }
+      },
+      {
+        "name": "mock",
+        "params": {
+          "enabled": {
+            "type": "bool",
+            "required": true
+          }
+        },
+        "timeout_ms": 25000,
+        "output": {
+          "variable": "glassesMock",
+          "callback": "onGlassesMock"
+        }
+      }
+    ],
+    "events": [
+      {
+        "name": "state",
+        "callback": "onGlassesState",
+        "scope": "document"
+      },
+      {
+        "name": "media",
+        "callback": "onGlassesMedia",
+        "scope": "document"
+      },
+      {
+        "name": "registration",
+        "callback": "onGlassesRegistration",
+        "scope": "document"
+      }
+    ]
+  },
+  "ios": {
+    "app": {
+      "entry_type": "GlassesExtension",
+      "sources": [
+        "ios/app/GlassesCore.swift",
+        "ios/app/GlassesExtension.swift",
+        "ios/app/GlassesMedia.swift",
+        "ios/app/GlassesServer.swift"
+      ],
+      "frameworks": [
+        "AVFoundation",
+        "CoreBluetooth",
+        "CoreMedia",
+        "CoreVideo",
+        "Network",
+        "UIKit"
+      ],
+      "packages": [
+        "MWDATCore",
+        "MWDATCamera",
+        "MWDATMockDevice"
+      ],
+      "requires": {
+        "usage_descriptions": [
+          "NSBluetoothAlwaysUsageDescription",
+          "NSLocalNetworkUsageDescription"
+        ]
+      },
+      "custom_keys": true,
+      "info_plist": {
+        "MWDAT": {
+          "AppLinkURLScheme": "nxglasses://",
+          "MetaAppID": "0",
+          "ClientToken": "",
+          "TeamID": ""
+        },
+        "UIBackgroundModes": [
+          "processing",
+          "bluetooth-central",
+          "bluetooth-peripheral",
+          "external-accessory"
+        ],
+        "UISupportedExternalAccessoryProtocols": [
+          "com.meta.ar.wearable"
+        ],
+        "NSBonjourServices": [
+          "_bonjour._tcp"
+        ]
+      },
+      "lifecycle": [
+        "launch",
+        "open_url"
+      ],
+      "claims": {
+        "url_schemes": [
+          "nxglasses"
+        ]
+      }
+    },
+    "packages": [
+      {
+        "name": "MetaWearablesDAT",
+        "products": [
+          "MWDATCore",
+          "MWDATCamera",
+          "MWDATMockDevice"
+        ],
+        "remote": {
+          "url": "https://github.com/facebook/meta-wearables-dat-ios",
+          "revision": "2c772e03e6a2e74282ac6564c2424acf6e58d8f0"
+        },
+        "weak": true
+      }
+    ],
+    "package_resolved": "ios/Package.resolved"
+  },
+  "android": {
+    "entry_class": "despia.ext.metaglasses.GlassesExtension",
+    "requires": {
+      "permissions": [
+        "android.permission.BLUETOOTH_CONNECT"
+      ]
+    },
+    "lifecycle": [
+      "activity_lifecycle",
+      "new_intent"
+    ],
+    "claims": {
+      "intent_schemes": [
+        "nxglasses"
+      ]
+    },
+    "min_sdk": 29,
+    "meta_data": [
+      {
+        "name": "com.meta.wearable.mwdat.APPLICATION_ID",
+        "value": "0"
+      },
+      {
+        "name": "com.meta.wearable.mwdat.CLIENT_TOKEN",
+        "value": "0"
+      }
+    ],
+    "modules": [
+      {
+        "kind": "typed",
+        "name": "glasses",
+        "namespace": "despia.ext.metaglasses",
+        "sources": [
+          "android/glasses/java/despia/ext/metaglasses/DatInterop.java",
+          "android/glasses/java/despia/ext/metaglasses/GlassesCore.java",
+          "android/glasses/java/despia/ext/metaglasses/GlassesExtension.java",
+          "android/glasses/java/despia/ext/metaglasses/GlassesMedia.java",
+          "android/glasses/java/despia/ext/metaglasses/GlassesServer.java"
+        ],
+        "permissions": [
+          "android.permission.INTERNET"
+        ],
+        "dependencies": [
+          "com.meta.wearable:mwdat-core:1.1.0",
+          "com.meta.wearable:mwdat-camera:1.1.0",
+          "com.meta.wearable:mwdat-mockdevice:1.1.0",
+          "androidx.activity:activity:1.13.0"
+        ]
+      }
+    ]
+  }
+}
