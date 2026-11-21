@@ -1,6 +1,6 @@
 # Meta Glasses
 
-Source preview for Despia V3. This snapshot requires the runtime update currently awaiting release and an approved extension-enabled native build. Uploading these files does not change an installed app.
+Source preview for Despia V3. The runtime update and automatic discovery rollout are awaiting release. Rebuild and install the native app to include these files; uploading them does not change an installed app.
 
 Camera access and live streaming for supported Meta glasses through a native extension. Glasses hardware validation is pending.
 
@@ -19,11 +19,11 @@ Use the Despia SDK with React, Vue, Svelte, Next.js, TanStack or HTML5. Projects
 - `manifest.json`: the extension's routes, parameters, events and native files.
 - `ios/` and `android/`: the Swift and Kotlin or Java sources and resources the manifest names.
 - `extensions.example.json`: the entry for `public/despia/extensions.json`.
-- `metaglasses.policy.json`: the approval policy. It is a file you send to Despia with your approval request, together with the extension files. It is not served from your site and does not go into `public/despia/`.
+- `metaglasses.policy.json`: the build verification policy. It records declarations used by signed build verification. It is not served from your site and does not go into `public/despia/`.
 
 ## Requirements
 
-- A Despia V3 app with V3 Extensions enabled, and a web app that serves static files from its own HTTPS origin.
+- A Despia V3 app and a web app that serves static files from its own HTTPS origin.
 - The `despia-native` JavaScript SDK (`npm install despia-native`).
 - Meta glasses and the Meta AI app, with Developer Mode turned on for testing.
 - A Meta Wearables Developer Center app for production use.
@@ -33,7 +33,9 @@ Use the Despia SDK with React, Vue, Svelte, Next.js, TanStack or HTML5. Projects
 1. Copy `manifest.json`, `ios/` and `android/` into `public/despia/metaglasses/` in your web app. The folder name is the extension id, so pages call `extension://metaglasses/<route>`. Keep every path inside the folder unchanged, because the manifest names them. (`public/` is the folder your site serves from its root; in SvelteKit, use `static/`.)
 2. Add `"metaglasses"` to the `extensions` list in `public/despia/extensions.json`. `extensions.example.json` shows the entry. Despia takes app identity from the build configuration.
 3. Set the values listed under "Values to set before you build". Vendor keys and hosts in this repository are placeholders only. Never put a server secret in the manifest or anywhere in your web app.
-4. Request approval and a new native build in Despia, and send `metaglasses.policy.json` with the request. Despia reviews and approves these exact files before a build includes them, and any change to the manifest or to a native file needs a new approval and a new native build. It cannot be applied over the air.
+4. Rebuild and install the native app with these extension files. Any change to the manifest or native source requires another native build. It cannot be applied over the air.
+
+Signed build verification binds source hashes, dependency pins, app identity and final artifacts. It is separate from human code review and does not require a per-app enrollment switch.
 
 ## JavaScript SDK
 
@@ -207,7 +209,7 @@ The app registers once with the Meta AI app. That opens Meta AI, which returns t
 - **Application meta-data.** `com.meta.wearable.mwdat.APPLICATION_ID` and `CLIENT_TOKEN`, from `android.meta_data` in the manifest.
 - **Minimum Android.** `min_sdk` is 29 (Android 10). Below that, every route answers `platform_limit`.
 - **Libraries.** `mwdat-core`, `mwdat-camera` and `mwdat-mockdevice` 1.1.0 from Maven Central, and `androidx.activity:activity:1.13.0`.
-- **Exported component.** The Meta SDK adds a registration service that the Meta AI app binds to. It is listed in the approval policy as Meta ships it.
+- **Exported component.** The Meta SDK adds a registration service that the Meta AI app binds to. It is listed in the build verification policy as Meta ships it.
 
 ---
 
