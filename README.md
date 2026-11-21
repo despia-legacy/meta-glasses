@@ -119,9 +119,22 @@ if (photo === undefined) throw new Error('No native reply within 30 seconds');
 if (!photo.ok) throw new Error(photo.code + ': ' + photo.error);
 
 document.querySelector('#photo').src = photo.data.url;
-globalThis.onGlassesMedia = media => {
-  if (media.kind === 'mp4' && !media.failed) document.querySelector('#clip').src = media.url;
+const previousGlassesMedia = globalThis.onGlassesMedia;
+const handleGlassesMedia = media => {
+  try {
+    if (typeof previousGlassesMedia === 'function') previousGlassesMedia(media);
+  } finally {
+    if (media.kind === 'mp4' && !media.failed) document.querySelector('#clip').src = media.url;
+  }
 };
+globalThis.onGlassesMedia = handleGlassesMedia;
+const cleanupGlassesMedia = () => {
+  if (globalThis.onGlassesMedia !== handleGlassesMedia) return;
+  if (previousGlassesMedia === undefined) delete globalThis.onGlassesMedia;
+  else globalThis.onGlassesMedia = previousGlassesMedia;
+};
+// Call cleanupGlassesMedia() when this component unmounts.
+
 // Remove or restore your event callback on unmount. Stop streaming with the stop route.
 ```
 
