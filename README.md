@@ -43,19 +43,23 @@ Install the SDK in your web app:
 npm install despia-native
 ```
 
-Copy `example/src/lib/despia-extension.js` to your app's `src/lib/` and adjust the import path if needed. It imports `despia` from `despia-native`, calls the SDK and returns the native answer's `data`. It checks native error envelopes and throws an error with their `code`. The SDK itself resolves native `ok: false` envelopes; it does not reject them. A single watched value becomes `undefined` after 30 seconds, which this helper reports as `sdk_timeout`.
+Call the published SDK directly and watch the exact answer variable declared in `manifest.json`. The SDK resolves to an object keyed by that variable; the native envelope is inside it. Check both a missing reply and `ok: false` before using `data`. Native errors resolve through the SDK; they do not reject its promise. A single watched variable becomes `undefined` after 30 seconds without a reply.
 
-Each helper call forwards a unique native callback into a separate watched value, so overlapping calls do not share response globals. `onExtensionEvent` registers the declared native event callbacks and returns a cleanup function. Events are callbacks, not values you can poll from the SDK proxy.
+Await calls that use the same answer variable sequentially. The SDK's command queue does not correlate concurrent responses. Encode every query value with `encodeURIComponent`, including JSON text. Spaces become `%20`; a literal plus becomes `%2B`. Do not use unmodified `URLSearchParams` form encoding, which uses plus for spaces.
 
-Importing the SDK is safe during server rendering. Run calls and event subscriptions only from browser click handlers or mounted client hooks. React and Vue can use the browser APIs used by this helper; in Next.js and other server-rendered apps, keep these calls in client code. The extension must be included in the installed Despia V3 app; a browser preview has no native extension features.
+Importing the SDK is safe during server rendering. Run native calls only in browser click handlers or mounted client hooks, including client components in Next.js. The extension must be included in the installed Despia V3 app; a browser preview has no native extension features. Optional event handlers use the declared callback on `globalThis`, not an SDK subscription API. Save and restore any callback your app already owns when a component mounts and unmounts.
 
 ## Calling it
 
 ```javascript
-import { extensionCall } from './lib/despia-extension.js';
+import despia from 'despia-native';
 
-const answer = await extensionCall('metaglasses', 'status');
-console.log(answer);
+const answerReply = await despia('extension://metaglasses/status', ['glassesStatus']);
+const answer = answerReply.glassesStatus;
+if (answer === undefined) throw new Error('No native reply within 30 seconds');
+if (!answer.ok) throw new Error(answer.code + ': ' + answer.error);
+
+console.log(answer.data);
 ```
 
 Calls use `extension://metaglasses/<route>?<params>`. Each route answers once, in the page that made the call: the runtime sets the route's answer variable in the page, then calls the route's callback. Only declared parameters are accepted. Keep large data on the native side and pass identifiers through the bridge. A call URL is at most 8192 characters.
@@ -93,37 +97,32 @@ Despia takes app identity from the existing build configuration. If your app has
 ## Using it from your web app
 
 ```javascript
-import { extensionCall, onExtensionEvent } from './lib/despia-extension.js';
-const glasses = (route, params) => extensionCall('metaglasses', route, params);
-const image = document.querySelector('#glasses');
-const clip = document.querySelector('#clip');
-const stopState = onExtensionEvent('onGlassesState', state => {
-  if (state.state !== 'streaming') image.removeAttribute('src');
-});
-const stopMedia = onExtensionEvent('onGlassesMedia', media => {
-  if (media.kind === 'mp4' && !media.failed) clip.src = media.url;
-});
-const stopRegistration = onExtensionEvent('onGlassesRegistration', registration => console.log(registration));
+import despia from 'despia-native';
 
-export async function startCamera() {
-  let permission = await glasses('permission', { prompt: true });
-  if (permission.camera === 'unknown') {
-    await glasses('register');
-    return; // After registration completes in Meta AI, run startCamera() again.
-  }
-  if (permission.camera !== 'granted') return;
-  const stream = await glasses('start', { quality: 'medium', fps: 24 });
-  image.src = stream.live;
-}
-export async function takePhoto() {
-  const photo = await glasses('photo');
-  document.querySelector('#photo').src = photo.url;
-}
-export async function stopCamera() {
-  await glasses('stop'); image.removeAttribute('src');
-}
-// await glasses('record_start', { seconds: 5 });
-// On unmount: stopState(); stopMedia(); stopRegistration();
+const permissionReply = await despia(`extension://metaglasses/permission?prompt=${encodeURIComponent(true)}`, ['glassesPermission']);
+const permission = permissionReply.glassesPermission;
+if (permission === undefined) throw new Error('No native reply within 30 seconds');
+if (!permission.ok) throw new Error(permission.code + ': ' + permission.error);
+
+if (permission.data.camera !== 'granted') throw new Error('Register the glasses and grant camera access first');
+
+const streamReply = await despia(`extension://metaglasses/start?quality=${encodeURIComponent('medium')}&fps=${encodeURIComponent(24)}`, ['glassesStart']);
+const stream = streamReply.glassesStart;
+if (stream === undefined) throw new Error('No native reply within 30 seconds');
+if (!stream.ok) throw new Error(stream.code + ': ' + stream.error);
+
+document.querySelector('#glasses').src = stream.data.live;
+
+const photoReply = await despia('extension://metaglasses/photo', ['glassesPhoto']);
+const photo = photoReply.glassesPhoto;
+if (photo === undefined) throw new Error('No native reply within 30 seconds');
+if (!photo.ok) throw new Error(photo.code + ': ' + photo.error);
+
+document.querySelector('#photo').src = photo.data.url;
+globalThis.onGlassesMedia = media => {
+  if (media.kind === 'mp4' && !media.failed) document.querySelector('#clip').src = media.url;
+};
+// Remove or restore your event callback on unmount. Stop streaming with the stop route.
 ```
 
 Each route answers once in its own callback, listed in the table below.
