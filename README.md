@@ -201,7 +201,7 @@ The app registers once with the Meta AI app. That opens Meta AI, which returns t
 
 - **Info.plist.** The manifest sets the `MWDAT` keys (`AppLinkURLScheme`, `MetaAppID`, `ClientToken`, `TeamID`), the background modes `bluetooth-central`, `bluetooth-peripheral` and `external-accessory`, the accessory protocol `com.meta.ar.wearable`, and `NSBonjourServices` with `_bonjour._tcp`.
 - **Purpose strings.** `NSBluetoothAlwaysUsageDescription` and `NSLocalNetworkUsageDescription`, under `requires.usage_descriptions`.
-- **Package.** Meta's SwiftPM package, pinned in `ios/Package.resolved`. The extension answers `platform_limit` below iOS 17.2, and the app still launches on earlier iOS versions.
+- **Package.** Meta's SwiftPM package, pinned in `ios/Package.resolved`. The route handler checks for iOS 17.2 before starting the toolkit. App launch on earlier iOS versions has not been tested.
 
 ### Android
 
