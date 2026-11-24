@@ -440,9 +440,24 @@ final class GlassesController {
             if session === s, ok { return nil }
             return sessionError ?? .error(code: "no_device", message: "the glasses session stopped before it started")
         }
+        let selector: any DeviceSelector
+        if let device {
+            selector = SpecificDeviceSelector(device: device)
+        } else {
+            // Meta, DAT 1.1.0 Display access guide (iOS): AutoDeviceSelector updates from devicesStream(); wait for
+            // it to name an active device before createSession, otherwise createSession throws noEligibleDevice.
+            // Bounded to 3 s and only while DAT lists a device, so no glasses still answers no_device at once.
+            let auto = AutoDeviceSelector(wearables: Wearables.shared)
+            let until = DispatchTime.now() + .seconds(3)
+            while auto.activeDevice == nil, !Wearables.shared.devices.isEmpty, call.isActive, DispatchTime.now() < until {
+                try? await Task.sleep(nanoseconds: 50_000_000)
+            }
+            // Another call may have opened the session while this one waited.
+            if session != nil { return await openSession(call, device: device) }
+            selector = auto
+        }
         let s: DeviceSession
         do {
-            let selector: any DeviceSelector = device.map { SpecificDeviceSelector(device: $0) } ?? AutoDeviceSelector(wearables: Wearables.shared)
             s = try Wearables.shared.createSession(deviceSelector: selector)
         } catch {
             return Self.sessionError(error)
