@@ -2,7 +2,7 @@
 
 Source preview for Despia V3. The runtime update and automatic discovery rollout are awaiting release. Rebuild and install the native app to include these files; uploading them does not change an installed app.
 
-Camera access and live streaming for supported Meta glasses through a native extension. Glasses hardware validation is pending.
+Meta glasses through Meta's Wearables Device Access Toolkit 1.1.0: registration, devices and sessions, the camera stream, photos and clips with audio, speech, motion, inputs, voice, the Meta Ray-Ban Display and the audio route. Glasses hardware validation is pending.
 
 This ready-made extension is part of Despia V3 Extensions. First-party V4 support comes through the new package registry, with a different package shape.
 
@@ -25,7 +25,8 @@ Use the Despia SDK with React, Vue, Svelte, Next.js, TanStack or HTML5. Projects
 
 - A Despia V3 app and a web app that serves static files from its own HTTPS origin.
 - The `despia-native` JavaScript SDK (`npm install despia-native`).
-- Meta glasses and the Meta AI app, with Developer Mode turned on for testing.
+- Meta glasses and the Meta AI app, with Developer Mode turned on for testing. Debug builds can use the simulated glasses instead.
+- iOS 17.2 or later, Android 10 (API 29) or later.
 - A Meta Wearables Developer Center app for production use.
 
 ## Install
@@ -74,7 +75,17 @@ Standard error codes: `bad_request` (an undeclared or missing parameter, or a va
 
 ## About
 
-This extension connects the phone to Meta glasses through Meta's Wearables Device Access Toolkit (DAT). Your page starts and stops the glasses' camera stream and shows it live. It can take a photo and record a short clip. A simulated pair of glasses (the Mock Device Kit) stands in for real glasses in debug builds.
+This extension connects the phone to Meta glasses through Meta's Wearables Device Access Toolkit (DAT) 1.1.0, the latest release (20 November 2026). It covers what DAT offers on both platforms:
+
+- **Registration** with the Meta AI app, including registration that Meta AI starts itself, and the glasses permissions (camera and microphone).
+- **Devices and sessions.** The paired glasses with their link, battery, charging, worn, hinge, thermal and compatibility state. One device session is shared by every capability, and the page can pause and resume it.
+- **Camera.** A live stream (with the glasses' audio if you ask), photos from the stream or as full still photos, and clips recorded as MP4 with H.264 video and AAC audio.
+- **Speech, motion, inputs and voice.** Transcription on the glasses, motion sensor samples, the touch pad and buttons, and "Hey Meta" launches of your app.
+- **Display.** View trees, video and clicks on Meta Ray-Ban Display.
+- **Audio route.** Phone audio to and from the glasses as a Bluetooth headset.
+- **Updates.** Opening the Meta AI firmware or glasses app update.
+
+A simulated pair of glasses (the Mock Device Kit) stands in for real glasses in debug builds.
 
 Live preview and saved media use local HTTP URLs. Your page can show the live stream in an `<img>`. The optional `frame` and `media_read` routes return base64 data through the bridge.
 
@@ -86,13 +97,13 @@ Despia takes app identity from the existing build configuration. If your app has
 
 ### Your own values
 
-- **URL scheme.** `nxglasses` appears three times in `manifest.json`: in `MWDAT.AppLinkURLScheme` (as `nxglasses://`), in iOS `claims.url_schemes` and in Android `claims.intent_schemes`. Replace all three with one scheme of your own. The Meta AI app returns to this scheme after registration and after the camera permission.
+- **URL scheme.** `nxglasses` appears three times in `manifest.json`: in `MWDAT.AppLinkURLScheme` (as `nxglasses://`), in iOS `claims.url_schemes` and in Android `claims.intent_schemes`. Replace all three with one scheme of your own. The Meta AI app returns to this scheme after registration and after a permission.
 - **Meta app credentials.**
   - For Developer Mode, keep `MetaAppID` as `"0"`, `ClientToken` and `TeamID` empty, and turn on Developer Mode in Meta AI (Settings, then your glasses).
   - For production, set `MetaAppID` and `ClientToken` from your app in Meta's Wearables Developer Center, and set `TeamID` to your Apple Developer Team ID. The same two Meta values go into the Android values `com.meta.wearable.mwdat.APPLICATION_ID` and `CLIENT_TOKEN` in `android.meta_data` (`"0"` in the extension).
   - These values ship inside your app, and `manifest.json` is served from your own origin, so anyone can read them. They are not secrets. Never put a Meta server-side secret in this file or anywhere in your web app.
   - You sign up with Meta and accept its terms on Meta's site yourself.
-- **Purpose strings.** Set `NSBluetoothAlwaysUsageDescription` and `NSLocalNetworkUsageDescription` with your other purpose strings in Despia.
+- **Purpose strings.** Set `NSBluetoothAlwaysUsageDescription`, `NSLocalNetworkUsageDescription` and `NSMicrophoneUsageDescription` with your other purpose strings in Despia. iOS asks for the microphone when `audio_route` opens the glasses as a headset.
 
 ---
 
@@ -108,14 +119,14 @@ if (!permission.ok) throw new Error(permission.code + ': ' + permission.error);
 
 if (permission.data.camera !== 'granted') throw new Error('Register the glasses and grant camera access first');
 
-const streamReply = await despia(`extension://metaglasses/start?quality=${encodeURIComponent('medium')}&fps=${encodeURIComponent(24)}`, ['glassesStart']);
+const streamReply = await despia(`extension://metaglasses/start?quality=${encodeURIComponent('medium')}&fps=${encodeURIComponent(24)}&audio=${encodeURIComponent(true)}`, ['glassesStart']);
 const stream = streamReply.glassesStart;
 if (stream === undefined) throw new Error('No native reply within 30 seconds');
 if (!stream.ok) throw new Error(stream.code + ': ' + stream.error);
 
 document.querySelector('#glasses').src = stream.data.live;
 
-const photoReply = await despia('extension://metaglasses/photo', ['glassesPhoto']);
+const photoReply = await despia(`extension://metaglasses/photo?resolution=${encodeURIComponent('full')}`, ['glassesPhoto']);
 const photo = photoReply.glassesPhoto;
 if (photo === undefined) throw new Error('No native reply within 30 seconds');
 if (!photo.ok) throw new Error(photo.code + ': ' + photo.error);
@@ -140,39 +151,107 @@ const cleanupGlassesMedia = () => {
 // Remove or restore your event callback on unmount. Stop streaming with the stop route.
 ```
 
-Each route answers once in its own callback, listed in the table below.
+Showing a view on Meta Ray-Ban Display sends a JSON view tree. Encode the JSON text as one value:
 
-### Routes
+```javascript
+import despia from 'despia-native';
 
-| Route                       | Parameters                                             | Callback                                    | Answer `data` | Answer variable |
-| --------------------------- | ------------------------------------------------------ | ------------------------------------------- | ------------- | --- |
-| `status`                    | none                                                   | `onGlassesStatus`                           | The state object, with `live`, `frame` and `mediaBase` URLs while streaming | `glassesStatus` |
-| `register`, `unregister`    | none                                                   | `onGlassesRegister`, `onGlassesUnregister`  | `registration`. The outcome follows as the `registration` event | `glassesRegister`, `glassesUnregister` |
-| `permission`                | `prompt` (bool)                                        | `onGlassesPermission`                       | `bluetooth` and `camera` (`granted`, `denied`, or `unknown` while the app is not registered) | `glassesPermission` |
-| `start`                     | `quality` (`low`, `medium`, `high`), `fps` (2 to 30)   | `onGlassesStart`                            | The state object with `live`, `frame` and `mediaBase` | `glassesStart` |
-| `stop`                      | none                                                   | `onGlassesStop`                             | The state object | `glassesStop` |
-| `photo`                     | none                                                   | `onGlassesPhoto`                            | The saved JPEG: `id`, `kind`, `url`, `width`, `height`. Also sent as the `media` event | `glassesPhoto` |
-| `record_start`              | `seconds` (1 to 60, required)                          | `onGlassesRecordStart`                      | `id`, `kind`, `seconds` and the `url` of the clip being recorded. It ends by itself or with `record_stop` | `glassesRecordStart` |
-| `record_stop`               | none                                                   | `onGlassesRecordStop`                       | The finished clip, also sent as the `media` event (`failed` when it could not be written) | `glassesRecordStop` |
-| `frame`                     | none                                                   | `onGlassesFrame`                            | `seq`, `width`, `height` and `jpeg` (base64) of the newest frame | `glassesFrame` |
-| `media`                     | none                                                   | `onGlassesMediaList`                        | `items`: the saved photos and clips | `glassesMediaList` |
-| `media_read`                | `id` (required), `kind` (`jpg`, `mp4`, required), `chunk` | `onGlassesMediaRead`                     | One 49152-byte chunk as base64, with `eof` on the last | `glassesMediaRead` |
-| `media_delete`              | `id`, `kind` (both required)                           | `onGlassesMediaDelete`                      | `id`, `kind`, `deleted: true` | `glassesMediaDelete` |
-| `mock`                      | `enabled` (bool, required)                             | `onGlassesMock`                             | Debug builds only. Release builds answer `mock_unavailable` before SDK initialization or teardown, including `enabled: false` | `glassesMock` |
+const displayReply = await despia('extension://metaglasses/display_start', ['glassesDisplayStart']);
+const display = displayReply.glassesDisplayStart;
+if (display === undefined) throw new Error('No native reply within 30 seconds');
+if (!display.ok) throw new Error(display.code + ': ' + display.error);
+
+const view = {type: 'box', direction: 'column', spacing: 8, padding: 16, children: [
+  {type: 'text', text: 'Next stop', style: 'heading'},
+  {type: 'buttons', children: [{type: 'button', label: 'Done', id: 'done', primary: true}]},
+]};
+const sendReply = await despia('extension://metaglasses/display_send?content=' + encodeURIComponent(JSON.stringify(view)), ['glassesDisplaySend']);
+const sent = sendReply.glassesDisplaySend;
+if (sent === undefined) throw new Error('No native reply within 30 seconds');
+if (!sent.ok) throw new Error(sent.code + ': ' + sent.error);
+// A tap on the button arrives as the display event: {click: 'done'}.
+```
+
+Each route answers once in its own callback, listed in the tables below. Routes that take `device` use the glasses with that `id` from `devices`. Without it, DAT picks the active glasses.
+
+### Routes: camera, registration and media
+
+| Route | Parameters | Callback | Answer `data` | Answer variable |
+| --- | --- | --- | --- | --- |
+| `status` | none | `onGlassesStatus` | The state object: `sdkVersion`, `bluetooth`, `registration`, `devices`, `state`, `quality`, `fps`, `width`, `height`, `frames`, `clip`, `photoBusy`, `mock`, `session`, `device`, `audio`, `audioRate`, `audioChannels`, `speech`, `motion`, `inputs`, `display`, `voice`, with `live`, `frame` and `mediaBase` URLs while streaming | `glassesStatus` |
+| `register`, `unregister` | none | `onGlassesRegister`, `onGlassesUnregister` | `registration`. The outcome follows as the `registration` event. Unregistering stops every session | `glassesRegister`, `glassesUnregister` |
+| `registration_continue` | none | `onGlassesRegistrationContinue` | `flowId`, `answer: "continue"`. Accepts the registration that Meta AI started (the `registration_request` event) | `glassesRegistrationContinue` |
+| `registration_cancel` | `return_to_meta_ai` (bool, iOS only, default `true`) | `onGlassesRegistrationCancel` | `flowId`, `answer: "cancel"`. Declines it; an existing registration is kept | `glassesRegistrationCancel` |
+| `permission` | `prompt` (bool), `kind` (`camera` or `microphone`, default `camera`) | `onGlassesPermission` | `bluetooth`, `camera` and `microphone` (`granted`, `denied`, or `unknown` while the app is not registered) | `glassesPermission` |
+| `start` | `quality` (`low`, `medium`, `high`), `fps` (2 to 30), `audio` (bool), `audio_rate` (`16000`, `44100`, `48000`), `audio_channels` (1 or 2), `device` | `onGlassesStart` | The state object with `live`, `frame` and `mediaBase` | `glassesStart` |
+| `stop` | none | `onGlassesStop` | The state object. Stops the camera only; other capabilities keep the session | `glassesStop` |
+| `photo` | `resolution` (`small`, `medium`, `large`, `full`), `quality` (`low`, `medium`, `high`) | `onGlassesPhoto` | The saved JPEG: `id`, `kind`, `url`, `width`, `height`. Also sent as the `media` event. Without parameters it captures from the running stream; with either parameter it takes a still photo and reports `photo_progress` | `glassesPhoto` |
+| `record_start` | `seconds` (1 to 60, required) | `onGlassesRecordStart` | `id`, `kind`, `seconds`, `audio` and the `url` of the clip being recorded. It ends by itself or with `record_stop` | `glassesRecordStart` |
+| `record_stop` | none | `onGlassesRecordStop` | The finished clip, also sent as the `media` event (`failed` when it could not be written) | `glassesRecordStop` |
+| `frame` | none | `onGlassesFrame` | `seq`, `width`, `height` and `jpeg` (base64) of the newest frame | `glassesFrame` |
+| `media` | none | `onGlassesMediaList` | `items`: the saved photos and clips | `glassesMediaList` |
+| `media_read` | `id` (required), `kind` (`jpg`, `mp4`, required), `chunk` | `onGlassesMediaRead` | One 49152-byte chunk as base64, with `eof` on the last | `glassesMediaRead` |
+| `media_delete` | `id`, `kind` (both required) | `onGlassesMediaDelete` | `id`, `kind`, `deleted: true` | `glassesMediaDelete` |
+| `open_update` | `target` (`firmware` or `glasses_app`, default `firmware`) | `onGlassesOpenUpdate` | `opened`: Meta AI shows the update | `glassesOpenUpdate` |
+
+### Routes: devices, session and capabilities
+
+| Route | Parameters | Callback | Answer `data` | Answer variable |
+| --- | --- | --- | --- | --- |
+| `devices` | none | `onGlassesDevices` | `devices`: each with `id`, `name`, `type`, `link`, `compatibility`, `battery`, `charging`, `worn`, `hinge`, `thermal`, `display` (bool) and `firmware` (`null` on iOS) | `glassesDevices` |
+| `session_start` | `device` | `onGlassesSessionStart` | `session`, `device`. Opens the shared session without starting a capability | `glassesSessionStart` |
+| `session_stop` | none | `onGlassesSessionStop` | The state object. Ends the session and every capability on it, with the camera | `glassesSessionStop` |
+| `pause`, `resume` | none | `onGlassesPause`, `onGlassesResume` | `session`, `device` | `glassesPause`, `glassesResume` |
+| `audio_route` | `mode` (`call`, `media` or `default`, default `call`) | `onGlassesAudioRoute` | `mode`, `inputs`, `outputs` and `glasses` (bool: the route reaches the glasses) | `glassesAudioRoute` |
+| `speech_start`, `speech_stop` | `device` (start) | `onGlassesSpeechStart`, `onGlassesSpeechStop` | `state`, `locale` | `glassesSpeechStart`, `glassesSpeechStop` |
+| `motion_start`, `motion_stop` | `device`, `rate` (`5`, `10`, `15`, `24`, `30` or `60` Hz, default `10`) (start) | `onGlassesMotionStart`, `onGlassesMotionStop` | `state`, `rate` | `glassesMotionStart`, `glassesMotionStop` |
+| `inputs_start`, `inputs_stop` | `device`, `sources` (comma list of `captouch`, `neural_band`, `capture_button`, `action_button`, `neural_band_drag`; empty for all), `consume_back` (bool, default `true`) (start) | `onGlassesInputsStart`, `onGlassesInputsStop` | `state`, `consumeBack` | `glassesInputsStart`, `glassesInputsStop` |
+| `voice_start`, `voice_stop` | `device` (start) | `onGlassesVoiceStart`, `onGlassesVoiceStop` | `state`, `device` | `glassesVoiceStart`, `glassesVoiceStop` |
+| `voice_respond` | `id` (required), `success` (bool, default `true`), `output` | `onGlassesVoiceRespond` | `id`, `sent` | `glassesVoiceRespond` |
+| `display_start`, `display_stop` | `device` (start) | `onGlassesDisplayStart`, `onGlassesDisplayStop` | `state`. Glasses without a display answer `unsupported_device` | `glassesDisplayStart`, `glassesDisplayStop` |
+| `display_send` | `content` (JSON view tree, required) | `onGlassesDisplaySend` | `sent: true` | `glassesDisplaySend` |
+| `display_video`, `display_video_stop` | `url` (an `https://` video URL, required) (video) | `onGlassesDisplayVideo`, `onGlassesDisplayVideoStop` | `playing` or `stopped: true` | `glassesDisplayVideo`, `glassesDisplayVideoStop` |
+| `display_clear` | none | `onGlassesDisplayClear` | `cleared: true` | `glassesDisplayClear` |
+| `mock` | `enabled` (bool, required), `model` (`rayban_meta`, `meta_rayban_display`, `oakley_meta_hstn`, `oakley_meta_vanguard`, `rayban_meta_optics`, `meta_glasses`) | `onGlassesMock` | Debug builds only. Release builds answer `mock_unavailable` before SDK initialization or teardown, including `enabled: false` | `glassesMock` |
+| `mock_event` | `event` (required), `value` (int), `text` | `onGlassesMockEvent` | Debug builds only, like `mock`. Drives the simulated glasses: `power_on`, `power_off`, `don`, `doff`, `fold`, `unfold`, `battery`, `charging`, `thermal` (0 to 6), `tap`, `tap_and_hold`, `nav_up`, `nav_down`, `nav_left`, `nav_right`, `select`, `back`, `capture` (`text`: `hold` or `double`), `action_button`, `drag`, `transcription`, `speech_locale`, `voice_launch`, `photo_failure`, `app_update_required`, `firmware_update_required`, `camera_permission`, `microphone_permission`, `display_click` | `glassesMockEvent` |
+
+### The display view tree
+
+`display_send` takes one JSON object. Each node has a `type` and string, number or boolean attributes. Both platforms accept and refuse the same documents: at most 64 nodes, 8 levels deep, strings up to 512 characters and numbers up to 10000.
+
+- `box`: `children`, `direction` (`row`, `column`, `row_reverse`, `column_reverse`), `spacing`, `padding`, `padding_top`, `padding_bottom`, `padding_start`, `padding_end`, `align`, `cross`, `wrap`, `background` (`none`, `card`), `id` (a box with an `id` is clickable).
+- `text`: `text`, `style` (`heading`, `body`, `meta`), `color` (`primary`, `secondary`).
+- `button`: `label`, `style` (`primary`, `secondary`, `outline`), `icon`, `id`, `primary`.
+- `buttons`: `children` (buttons only), `align` (`start`, `center`, `end`).
+- `icon`: `name` (DAT's icon names in snake case, such as `arrow_u_left`), `style` (`filled`, `outline`).
+- `image`: `src` (an `https://` URL), `size` (`icon`, `fill`), `radius` (`none`, `small`, `medium`).
+- Every node also takes `grow`, `shrink` and `self` (`start`, `center`, `end`, `stretch`).
 
 ### Events
 
-| Event          | Callback                 | Scope      | When                                                              |
-| -------------- | ------------------------ | ---------- | ----------------------------------------------------------------- |
-| `state`        | `onGlassesState`         | `document` | The stream state changed                                          |
-| `media`        | `onGlassesMedia`         | `document` | A photo or clip finished, or failed                               |
-| `registration` | `onGlassesRegistration`  | `document` | The Meta AI app answered the registration                         |
+| Event | Callback | Scope | When |
+| --- | --- | --- | --- |
+| `state` | `onGlassesState` | `document` | The stream state changed |
+| `media` | `onGlassesMedia` | `document` | A photo or clip finished, or failed |
+| `registration` | `onGlassesRegistration` | `document` | The Meta AI app answered the registration |
+| `registration_request` | `onGlassesRegistrationRequest` | `document` | Meta AI started a registration: `flowId`, `protocolVersion`. Answer with `registration_continue` or `registration_cancel` |
+| `device` | `onGlassesDevice` | `document` | Glasses were added, changed or removed: `id`, `change` (`added`, `state`, `compatibility`, `removed`) and the device fields |
+| `session` | `onGlassesSession` | `document` | The session changed: `state` (`starting`, `started`, `paused`, `stopping`, `stopped`), `device`, and `error` with `message` or `reason` |
+| `photo_progress` | `onGlassesPhotoProgress` | `document` | A still photo is being transferred: `received`, `total`, `fraction` |
+| `speech` | `onGlassesSpeech` | `document` | Speech `state`, a transcription (`text`, `final`, `confidence`), a `locale`, or `error` |
+| `motion` | `onGlassesMotion` | `document` | Motion `state`, or `samples` every 100 ms: `t`, `accel`, `gyro`, `mag`, `orientation` (x, y, z, w) and `source` |
+| `input` | `onGlassesInput` | `document` | An input `state`, or an input: `kind` (`nav`, `select`, `back`, `capture`, `button`, ...), `source`, and `direction` or `press` |
+| `voice` | `onGlassesVoice` | `document` | "Hey Meta" launched your app: `kind: "launch_app"`, `id`, `device`. Answer with `voice_respond` |
+| `display` | `onGlassesDisplay` | `document` | The display `state`, a `click` with the node `id`, or a `video` state or error |
+| `audio` | `onGlassesAudio` | `document` | The phone's audio route changed while `audio_route` is set |
 
 On Android a failed registration arrives on the `registration` event with `error` and `message`. On iOS `register` answers with the error itself.
 
 ### Error codes
 
-`bad_request`, `busy`, `capture_failed`, `device_limit` (too hot, battery low or at peak power), `glasses_folded`, `init_failed`, `meta_ai_missing`, `mock_failed`, `mock_unavailable`, `no_device`, `not_found`, `not_recording`, `not_streaming`, `permission_denied`, `permission_failed`, `record_failed`, `registration_failed`, `registration_required`, `registration_unauthorized` (Meta refused this app without opening Meta AI), `server_failed`, `session_failed`, `stream_failed` and `timeout`.
+`audio_failed`, `bad_request`, `busy`, `capture_failed`, `device_limit` (too hot, battery low or at peak power), `display_failed`, `glasses_folded`, `init_failed`, `meta_ai_missing`, `mock_failed`, `mock_unavailable`, `no_device`, `not_active` (no session, or the capability is not on), `not_found`, `not_listening`, `not_recording`, `not_streaming`, `permission_denied`, `permission_failed`, `record_failed`, `registration_failed`, `registration_required`, `registration_unauthorized` (Meta refused this app without opening Meta AI), `server_failed`, `session_failed`, `stream_failed`, `timeout`, `unavailable` and `unsupported_device` (the glasses lack the capability, such as a display).
+
+Errors from a capability on its event, or as a session error: `device_update_required`, `glasses_app_update_required`, `sdk_update_required`, `speech_failed`, `motion_failed`, `inputs_failed` and `voice_failed`. `update_suggested` is a warning on the `session` event; the session keeps running.
 
 - Only on iOS: `platform_limit` (iOS before 17.2).
 - Only on Android: `handler_error`, `permission_required` and `unavailable` (the activity is gone).
@@ -189,37 +268,47 @@ The extension runs a small HTTP server on `127.0.0.1`, on a port the system pick
 - `/<token>/frame.jpg` is the newest frame once.
 - `/<token>/media/<id>.jpg` and `/<token>/media/<id>.mp4` are the saved photos and clips. They support byte ranges, so a `<video src>` can seek in a clip.
 
-Each frame costs one JPEG encode on the phone. A clip is H.264 MP4 written from the same frames.
+Each frame costs one JPEG encode on the phone. A clip is an MP4 with H.264 video from the same frames and, when `start` asked for `audio`, AAC audio from the glasses' microphones at the stream's sample rate and channel count.
 
 If your WebView blocks local HTTP media, poll `frame` and draw `"data:image/jpeg;base64," + r.data.jpeg` when `r.data.seq` changed. Read saved media with `media_read?id=<id>&kind=mp4&chunk=<n>`: each chunk is 49152 bytes until `data.eof` is true.
 
 ## Registration and permissions
 
-The app registers once with the Meta AI app. That opens Meta AI, which returns to your app's own URL scheme. The glasses camera permission is asked in Meta AI too. Call `permission` with `prompt: true` first, then `register` when `camera` is `unknown`, then `permission` again.
+The app registers once with the Meta AI app. That opens Meta AI, which returns to your app's own URL scheme. The glasses camera and microphone permissions are asked in Meta AI too. Call `permission` with `prompt: true` first, then `register` when `camera` is `unknown`, then `permission` again. Meta AI can also start a registration itself: the page gets `registration_request` and answers it.
 
 ### iOS
 
 - **Info.plist.** The manifest sets the `MWDAT` keys (`AppLinkURLScheme`, `MetaAppID`, `ClientToken`, `TeamID`), the background modes `bluetooth-central`, `bluetooth-peripheral` and `external-accessory`, the accessory protocol `com.meta.ar.wearable`, and `NSBonjourServices` with `_bonjour._tcp`.
-- **Purpose strings.** `NSBluetoothAlwaysUsageDescription` and `NSLocalNetworkUsageDescription`, under `requires.usage_descriptions`.
-- **Package.** Meta's SwiftPM package, pinned in `ios/Package.resolved`. The route handler checks for iOS 17.2 before starting the toolkit. App launch on earlier iOS versions has not been tested.
+- **Purpose strings.** `NSBluetoothAlwaysUsageDescription`, `NSLocalNetworkUsageDescription` and `NSMicrophoneUsageDescription`, under `requires.usage_descriptions`.
+- **Package.** Meta's SwiftPM package 1.1.0 (`MWDATCore`, `MWDATCamera`, `MWDATDisplay`, `MWDATInputs`, `MWDATMotion`, `MWDATSpeech`, `MWDATMockDevice`), pinned in `ios/Package.resolved`. The route handler checks for iOS 17.2 before starting the toolkit. App launch on earlier iOS versions has not been tested.
 
 ### Android
 
-- **Permissions.** `BLUETOOTH_CONNECT` (under `requires.permissions`) and `INTERNET`. The extension asks for `BLUETOOTH_CONNECT` before it starts the SDK.
+- **Permissions.** `BLUETOOTH_CONNECT` (under `requires.permissions`) and `INTERNET`. The extension asks for `BLUETOOTH_CONNECT` before it starts the SDK. `audio_route` needs `MODIFY_AUDIO_SETTINGS`, which the Despia V3 app already declares; without it the route answers `permission_denied`.
 - **Application meta-data.** `com.meta.wearable.mwdat.APPLICATION_ID` and `CLIENT_TOKEN`, from `android.meta_data` in the manifest.
 - **Minimum Android.** `min_sdk` is 29 (Android 10). Below that, every route answers `platform_limit`.
-- **Libraries.** `mwdat-core`, `mwdat-camera` and `mwdat-mockdevice` 1.1.0 from Maven Central, and `androidx.activity:activity:1.13.0`.
+- **Libraries.** `mwdat-core`, `mwdat-camera`, `mwdat-display`, `mwdat-inputs`, `mwdat-motion`, `mwdat-speech` and `mwdat-mockdevice` 1.1.0 from Maven Central, and `androidx.activity:activity:1.13.0`.
 - **Exported component.** The Meta SDK adds a registration service that the Meta AI app binds to. It is listed in the build verification policy as Meta ships it.
 
 ---
 
 ## Platform limits
 
-- **Meta DAT 1.1.0.** A session created before registration fails and is reported as `registration_required`. Unregistering stops every session. A refused stream start reports a hot device, a low battery or the peak power limit as `device_limit`. A photo times out after 10 seconds.
-- **Photo.** The `photo` implementation captures from the running stream.
-- **Clips.** DAT offers no video recording, so the clip is the app's own encoding of the stream's frames.
+Sources: Meta's DAT 1.1.0 changelog for [iOS](https://github.com/meta/meta-wearables-dat-ios/blob/main/CHANGELOG.md) and [Android](https://github.com/meta/meta-wearables-dat-android/blob/main/CHANGELOG.md), release 1.1.0 of 20 November 2026, and the 1.1.0 SDK interfaces.
+
+- **Experimental in DAT 1.1.0.** Speech, motion, inputs, voice, still photos and camera audio are marked experimental by Meta. Apps can build and test with them, but Meta does not yet allow publishing apps that use them. They may change in a later DAT release.
+- **Sessions.** A session created before registration fails and is reported as `registration_required`. Unregistering stops every session. A refused stream start reports a hot device, a low battery or the peak power limit as `device_limit`. A photo from the stream times out after 10 seconds.
+- **Display.** Only Meta Ray-Ban Display has a display. Other glasses answer `unsupported_device`.
+- **Phone audio.** DAT carries no phone audio. `audio_route` uses the glasses as a standard Bluetooth headset (HFP for calls, A2DP for media) through the platform's own audio routing.
+- **Registration cancel.** On Android, DAT's `cancelRegistration()` has no choice to stay out of Meta AI, so `return_to_meta_ai` applies on iOS only.
+- **Firmware version.** iOS DAT exposes no firmware version, so `firmware` is `null` on iOS. Android reports it.
+- **Platform differences in events.** Android DAT reports extra voice `state` events and a `paused` motion state; iOS DAT has neither.
 - **iOS.** Meta's toolkit needs iOS 17.2.
 - **Android.** Meta's toolkit needs Android 10 (API 29).
+
+## What needs real glasses
+
+The automated tests cover the routes, parameters and answers on both platforms without glasses, the debug simulator, the display tree rules (the same 24 documents on iOS and Android), the local media server and the clip writer. These still need real glasses paired through Meta AI: a real registration, the camera stream and photos from the glasses, audio from the glasses' microphones, sensor data, "Hey Meta", and a real Meta Ray-Ban Display.
 
 ## License
 

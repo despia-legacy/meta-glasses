@@ -96,24 +96,43 @@ final class GlassesMedia {
      */
     static final class ClipRecorder {
         private static final long FINISH_TIMEOUT_NS = 2_000_000_000L;
+        /** Encoded samples held while the muxer waits for the other track's format. */
+        private static final int MAX_PENDING = 512;
         private final File file;
         private final int fps;
+        /** The stream's PCM rate and channels; 0 for a silent clip. */
+        private final int audioRate;
+        private final int audioChannels;
         private MediaCodec codec;
+        private MediaCodec audio;
         private MediaMuxer muxer;
         private int track = -1;
+        private int audioTrack = -1;
         private boolean muxing;
         private int samples;
+        private int audioSamples;
         private int width;
         private int height;
         private long firstPts = -1;
         private long lastPts;
+        private long lastAudioPts = -1;
+        private boolean videoEnded;
+        private boolean audioEnded;
         private boolean done;
         volatile boolean sizeChanged;
         private final MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
+        private final MediaCodec.BufferInfo audioInfo = new MediaCodec.BufferInfo();
+        private final java.util.ArrayList<Object[]> pending = new java.util.ArrayList<>();
 
         ClipRecorder(File file, int fps) {
+            this(file, fps, 0, 1);
+        }
+
+        ClipRecorder(File file, int fps, int audioRate, int audioChannels) {
             this.file = file;
             this.fps = fps;
+            this.audioRate = audioRate;
+            this.audioChannels = Math.max(1, Math.min(2, audioChannels));
         }
 
         /** Encodes one frame; false when the frame was not taken (no free input, or the clip ended). */
@@ -142,6 +161,40 @@ final class GlassesMedia {
             return true;
         }
 
+        /**
+         * Encodes the stream's 16-bit PCM as AAC beside the video, from the first video frame on
+         * (earlier audio has no clip time). False when it was not taken.
+         */
+        synchronized boolean offerAudio(ByteBuffer pcm, long ptsUs) {
+            if (done || audio == null || firstPts < 0 || ptsUs < firstPts || pcm == null) return false;
+            ByteBuffer src = pcm.duplicate();
+            long pts = ptsUs - firstPts;
+            if (pts <= lastAudioPts) return false;
+            int taken = 0;
+            while (src.hasRemaining()) {
+                int index = audio.dequeueInputBuffer(0);
+                if (index < 0) {
+                    drain(false, 0);
+                    return false;
+                }
+                ByteBuffer in = audio.getInputBuffer(index);
+                if (in == null) return false;
+                in.clear();
+                int n = Math.min(in.remaining(), src.remaining());
+                ByteBuffer slice = src.duplicate();
+                slice.limit(slice.position() + n);
+                in.put(slice);
+                src.position(src.position() + n);
+                audio.queueInputBuffer(index, 0, n, pts, 0);
+                lastAudioPts = pts;
+                // The next chunk starts n bytes later: 2 bytes per sample per channel.
+                pts += n * 1_000_000L / (2L * audioChannels * audioRate);
+                taken += n;
+            }
+            drain(false, 0);
+            return taken > 0;
+        }
+
         private void open(int w, int h) throws IOException {
             width = w;
             height = h;
@@ -153,35 +206,88 @@ final class GlassesMedia {
             codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC);
             codec.configure(f, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
             codec.start();
+            if (audioRate > 0) {
+                MediaFormat a = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, audioRate, audioChannels);
+                a.setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC);
+                a.setInteger(MediaFormat.KEY_BIT_RATE, 64_000 * audioChannels);
+                a.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 16384);
+                audio = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC);
+                audio.configure(a, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
+                audio.start();
+            }
             muxer = new MediaMuxer(file.getPath(), MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);
         }
 
+        /** Drains both encoders; with end, until both reported end of stream or the deadline. */
         private boolean drain(boolean end, long deadline) {
+            boolean v = videoEnded || drainOne(codec, info, false, end, deadline);
+            boolean a = audio == null || audioEnded || drainOne(audio, audioInfo, true, end, deadline);
+            return v && a;
+        }
+
+        private boolean drainOne(MediaCodec c, MediaCodec.BufferInfo bi, boolean isAudio, boolean end, long deadline) {
             while (true) {
                 if (end && System.nanoTime() - deadline >= 0) return false;
-                int out = codec.dequeueOutputBuffer(info, end ? 10_000 : 0);
+                int out = c.dequeueOutputBuffer(bi, end ? 10_000 : 0);
                 if (out == MediaCodec.INFO_TRY_AGAIN_LATER) {
                     if (!end) return false;
                     continue;
                 }
                 if (out == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-                    track = muxer.addTrack(codec.getOutputFormat());
-                    muxer.start();
-                    muxing = true;
+                    if (isAudio) {
+                        audioTrack = muxer.addTrack(c.getOutputFormat());
+                    } else {
+                        track = muxer.addTrack(c.getOutputFormat());
+                    }
+                    startMuxer();
                     continue;
                 }
                 if (out < 0) continue;
-                ByteBuffer data = codec.getOutputBuffer(out);
-                boolean config = (info.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0;
-                if (data != null && muxing && !config && info.size > 0) {
-                    data.position(info.offset);
-                    data.limit(info.offset + info.size);
-                    muxer.writeSampleData(track, data, info);
-                    samples++;
+                ByteBuffer data = c.getOutputBuffer(out);
+                boolean config = (bi.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0;
+                if (data != null && !config && bi.size > 0) {
+                    data.position(bi.offset);
+                    data.limit(bi.offset + bi.size);
+                    write(isAudio, data, bi);
                 }
-                codec.releaseOutputBuffer(out, false);
-                if ((info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) return true;
+                c.releaseOutputBuffer(out, false);
+                if ((bi.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
+                    if (isAudio) audioEnded = true; else videoEnded = true;
+                    return true;
+                }
             }
+        }
+
+        /** The muxer starts once every track it carries has its format. */
+        private void startMuxer() {
+            if (muxing || track < 0 || (audio != null && audioTrack < 0)) return;
+            muxer.start();
+            muxing = true;
+            for (Object[] p : pending) {
+                MediaCodec.BufferInfo bi = (MediaCodec.BufferInfo) p[2];
+                ByteBuffer b = ByteBuffer.wrap((byte[]) p[1]);
+                bi.offset = 0;
+                writeNow((Boolean) p[0], b, bi);
+            }
+            pending.clear();
+        }
+
+        private void write(boolean isAudio, ByteBuffer data, MediaCodec.BufferInfo bi) {
+            if (muxing) {
+                writeNow(isAudio, data, bi);
+                return;
+            }
+            if (pending.size() >= MAX_PENDING) return;
+            byte[] copy = new byte[data.remaining()];
+            data.duplicate().get(copy);
+            MediaCodec.BufferInfo held = new MediaCodec.BufferInfo();
+            held.set(0, copy.length, bi.presentationTimeUs, bi.flags);
+            pending.add(new Object[] {isAudio, copy, held});
+        }
+
+        private void writeNow(boolean isAudio, ByteBuffer data, MediaCodec.BufferInfo bi) {
+            muxer.writeSampleData(isAudio ? audioTrack : track, data, bi);
+            if (isAudio) audioSamples++; else samples++;
         }
 
         /** Ends the clip and closes the file. True when the MP4 holds at least one frame. */
@@ -195,9 +301,24 @@ final class GlassesMedia {
                     long deadline = System.nanoTime() + FINISH_TIMEOUT_NS;
                     int index = -1;
                     while (index < 0 && System.nanoTime() - deadline < 0) index = codec.dequeueInputBuffer(10_000);
+                    if (audio != null) {
+                        int ai = -1;
+                        while (ai < 0 && System.nanoTime() - deadline < 0) ai = audio.dequeueInputBuffer(10_000);
+                        if (ai >= 0) {
+                            audio.queueInputBuffer(ai, 0, 0, Math.max(0, lastAudioPts + 1), MediaCodec.BUFFER_FLAG_END_OF_STREAM);
+                        } else {
+                            audioEnded = true;
+                        }
+                    }
                     if (index >= 0) {
                         codec.queueInputBuffer(index, 0, 0, lastPts - firstPts + 1, MediaCodec.BUFFER_FLAG_END_OF_STREAM);
-                        ok = drain(true, deadline) && muxing && samples > 0;
+                        drain(true, deadline);
+                        // Audio that never produced a format leaves a silent clip, not a lost one.
+                        if (!muxing && track >= 0 && audio != null && audioTrack < 0) {
+                            audio = releaseQuietly(audio);
+                            startMuxer();
+                        }
+                        ok = videoEnded && muxing && samples > 0;
                     }
                 }
             } catch (RuntimeException e) {
@@ -214,6 +335,7 @@ final class GlassesMedia {
                 } catch (RuntimeException e) {
                     ok = false;
                 }
+                if (audio != null) audio = releaseQuietly(audio);
                 if (muxer != null) {
                     if (muxing) {
                         try {
@@ -230,6 +352,24 @@ final class GlassesMedia {
                 }
             }
             return ok;
+        }
+
+        private static MediaCodec releaseQuietly(MediaCodec c) {
+            try {
+                c.stop();
+            } catch (RuntimeException ignored) {
+                // Already stopped or failed; release below still frees it.
+            }
+            try {
+                c.release();
+            } catch (RuntimeException ignored) {
+                // Nothing more to free.
+            }
+            return null;
+        }
+
+        boolean hasAudio() {
+            return audioSamples > 0;
         }
 
         long durationMs() {

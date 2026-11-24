@@ -33,6 +33,13 @@
         "params": {
           "prompt": {
             "type": "bool"
+          },
+          "kind": {
+            "type": "enum",
+            "values": [
+              "camera",
+              "microphone"
+            ]
           }
         },
         "timeout_ms": 25000,
@@ -56,6 +63,26 @@
             "type": "int",
             "min": 2,
             "max": 30
+          },
+          "audio": {
+            "type": "bool"
+          },
+          "audio_rate": {
+            "type": "enum",
+            "values": [
+              "16000",
+              "44100",
+              "48000"
+            ]
+          },
+          "audio_channels": {
+            "type": "int",
+            "min": 1,
+            "max": 2
+          },
+          "device": {
+            "type": "string",
+            "max": 128
           }
         },
         "timeout_ms": 25000,
@@ -74,7 +101,25 @@
       },
       {
         "name": "photo",
-        "params": {},
+        "params": {
+          "resolution": {
+            "type": "enum",
+            "values": [
+              "small",
+              "medium",
+              "large",
+              "full"
+            ]
+          },
+          "quality": {
+            "type": "enum",
+            "values": [
+              "low",
+              "medium",
+              "high"
+            ]
+          }
+        },
         "timeout_ms": 25000,
         "output": {
           "variable": "glassesPhoto",
@@ -176,12 +221,378 @@
           "enabled": {
             "type": "bool",
             "required": true
+          },
+          "model": {
+            "type": "enum",
+            "values": [
+              "rayban_meta",
+              "meta_rayban_display",
+              "oakley_meta_hstn",
+              "oakley_meta_vanguard",
+              "rayban_meta_optics",
+              "meta_glasses"
+            ]
           }
         },
         "timeout_ms": 25000,
         "output": {
           "variable": "glassesMock",
           "callback": "onGlassesMock"
+        }
+      },
+      {
+        "name": "mock_event",
+        "params": {
+          "event": {
+            "type": "enum",
+            "values": [
+              "power_on",
+              "power_off",
+              "don",
+              "doff",
+              "fold",
+              "unfold",
+              "battery",
+              "charging",
+              "thermal",
+              "tap",
+              "tap_and_hold",
+              "nav_up",
+              "nav_down",
+              "nav_left",
+              "nav_right",
+              "select",
+              "back",
+              "capture",
+              "action_button",
+              "drag",
+              "transcription",
+              "speech_locale",
+              "voice_launch",
+              "photo_failure",
+              "app_update_required",
+              "firmware_update_required",
+              "camera_permission",
+              "microphone_permission",
+              "display_click"
+            ],
+            "required": true
+          },
+          "value": {
+            "type": "int",
+            "min": -1000,
+            "max": 1000
+          },
+          "text": {
+            "type": "string",
+            "max": 512
+          }
+        },
+        "output": {
+          "variable": "glassesMockEvent",
+          "callback": "onGlassesMockEvent"
+        }
+      },
+      {
+        "name": "devices",
+        "params": {},
+        "output": {
+          "variable": "glassesDevices",
+          "callback": "onGlassesDevices"
+        }
+      },
+      {
+        "name": "session_start",
+        "params": {
+          "device": {
+            "type": "string",
+            "max": 128
+          }
+        },
+        "timeout_ms": 25000,
+        "output": {
+          "variable": "glassesSessionStart",
+          "callback": "onGlassesSessionStart"
+        }
+      },
+      {
+        "name": "session_stop",
+        "params": {},
+        "output": {
+          "variable": "glassesSessionStop",
+          "callback": "onGlassesSessionStop"
+        }
+      },
+      {
+        "name": "pause",
+        "params": {},
+        "timeout_ms": 25000,
+        "output": {
+          "variable": "glassesPause",
+          "callback": "onGlassesPause"
+        }
+      },
+      {
+        "name": "resume",
+        "params": {},
+        "timeout_ms": 25000,
+        "output": {
+          "variable": "glassesResume",
+          "callback": "onGlassesResume"
+        }
+      },
+      {
+        "name": "registration_continue",
+        "params": {},
+        "timeout_ms": 25000,
+        "output": {
+          "variable": "glassesRegistrationContinue",
+          "callback": "onGlassesRegistrationContinue"
+        }
+      },
+      {
+        "name": "registration_cancel",
+        "params": {
+          "return_to_meta_ai": {
+            "type": "bool"
+          }
+        },
+        "timeout_ms": 25000,
+        "output": {
+          "variable": "glassesRegistrationCancel",
+          "callback": "onGlassesRegistrationCancel"
+        }
+      },
+      {
+        "name": "open_update",
+        "params": {
+          "target": {
+            "type": "enum",
+            "values": [
+              "firmware",
+              "glasses_app"
+            ]
+          }
+        },
+        "timeout_ms": 25000,
+        "output": {
+          "variable": "glassesOpenUpdate",
+          "callback": "onGlassesOpenUpdate"
+        }
+      },
+      {
+        "name": "audio_route",
+        "params": {
+          "mode": {
+            "type": "enum",
+            "values": [
+              "call",
+              "media",
+              "default"
+            ]
+          }
+        },
+        "output": {
+          "variable": "glassesAudioRoute",
+          "callback": "onGlassesAudioRoute"
+        }
+      },
+      {
+        "name": "speech_start",
+        "params": {
+          "device": {
+            "type": "string",
+            "max": 128
+          }
+        },
+        "timeout_ms": 25000,
+        "output": {
+          "variable": "glassesSpeechStart",
+          "callback": "onGlassesSpeechStart"
+        }
+      },
+      {
+        "name": "speech_stop",
+        "params": {},
+        "output": {
+          "variable": "glassesSpeechStop",
+          "callback": "onGlassesSpeechStop"
+        }
+      },
+      {
+        "name": "motion_start",
+        "params": {
+          "device": {
+            "type": "string",
+            "max": 128
+          },
+          "rate": {
+            "type": "enum",
+            "values": [
+              "5",
+              "10",
+              "15",
+              "24",
+              "30",
+              "60"
+            ]
+          }
+        },
+        "timeout_ms": 25000,
+        "output": {
+          "variable": "glassesMotionStart",
+          "callback": "onGlassesMotionStart"
+        }
+      },
+      {
+        "name": "motion_stop",
+        "params": {},
+        "output": {
+          "variable": "glassesMotionStop",
+          "callback": "onGlassesMotionStop"
+        }
+      },
+      {
+        "name": "inputs_start",
+        "params": {
+          "device": {
+            "type": "string",
+            "max": 128
+          },
+          "sources": {
+            "type": "string",
+            "max": 256
+          },
+          "consume_back": {
+            "type": "bool"
+          }
+        },
+        "timeout_ms": 25000,
+        "output": {
+          "variable": "glassesInputsStart",
+          "callback": "onGlassesInputsStart"
+        }
+      },
+      {
+        "name": "inputs_stop",
+        "params": {},
+        "output": {
+          "variable": "glassesInputsStop",
+          "callback": "onGlassesInputsStop"
+        }
+      },
+      {
+        "name": "display_start",
+        "params": {
+          "device": {
+            "type": "string",
+            "max": 128
+          }
+        },
+        "timeout_ms": 25000,
+        "output": {
+          "variable": "glassesDisplayStart",
+          "callback": "onGlassesDisplayStart"
+        }
+      },
+      {
+        "name": "display_stop",
+        "params": {},
+        "output": {
+          "variable": "glassesDisplayStop",
+          "callback": "onGlassesDisplayStop"
+        }
+      },
+      {
+        "name": "display_send",
+        "params": {
+          "content": {
+            "type": "string",
+            "max": 4096,
+            "required": true
+          }
+        },
+        "timeout_ms": 25000,
+        "output": {
+          "variable": "glassesDisplaySend",
+          "callback": "onGlassesDisplaySend"
+        }
+      },
+      {
+        "name": "display_video",
+        "params": {
+          "url": {
+            "type": "string",
+            "max": 2048,
+            "required": true
+          }
+        },
+        "timeout_ms": 25000,
+        "output": {
+          "variable": "glassesDisplayVideo",
+          "callback": "onGlassesDisplayVideo"
+        }
+      },
+      {
+        "name": "display_video_stop",
+        "params": {},
+        "timeout_ms": 25000,
+        "output": {
+          "variable": "glassesDisplayVideoStop",
+          "callback": "onGlassesDisplayVideoStop"
+        }
+      },
+      {
+        "name": "display_clear",
+        "params": {},
+        "timeout_ms": 25000,
+        "output": {
+          "variable": "glassesDisplayClear",
+          "callback": "onGlassesDisplayClear"
+        }
+      },
+      {
+        "name": "voice_start",
+        "params": {
+          "device": {
+            "type": "string",
+            "max": 128
+          }
+        },
+        "timeout_ms": 25000,
+        "output": {
+          "variable": "glassesVoiceStart",
+          "callback": "onGlassesVoiceStart"
+        }
+      },
+      {
+        "name": "voice_stop",
+        "params": {},
+        "output": {
+          "variable": "glassesVoiceStop",
+          "callback": "onGlassesVoiceStop"
+        }
+      },
+      {
+        "name": "voice_respond",
+        "params": {
+          "id": {
+            "type": "string",
+            "max": 128,
+            "required": true
+          },
+          "success": {
+            "type": "bool"
+          },
+          "output": {
+            "type": "string",
+            "max": 4096
+          }
+        },
+        "timeout_ms": 25000,
+        "output": {
+          "variable": "glassesVoiceRespond",
+          "callback": "onGlassesVoiceRespond"
         }
       }
     ],
@@ -200,6 +611,56 @@
         "name": "registration",
         "callback": "onGlassesRegistration",
         "scope": "document"
+      },
+      {
+        "name": "registration_request",
+        "callback": "onGlassesRegistrationRequest",
+        "scope": "document"
+      },
+      {
+        "name": "device",
+        "callback": "onGlassesDevice",
+        "scope": "document"
+      },
+      {
+        "name": "session",
+        "callback": "onGlassesSession",
+        "scope": "document"
+      },
+      {
+        "name": "photo_progress",
+        "callback": "onGlassesPhotoProgress",
+        "scope": "document"
+      },
+      {
+        "name": "speech",
+        "callback": "onGlassesSpeech",
+        "scope": "document"
+      },
+      {
+        "name": "motion",
+        "callback": "onGlassesMotion",
+        "scope": "document"
+      },
+      {
+        "name": "input",
+        "callback": "onGlassesInput",
+        "scope": "document"
+      },
+      {
+        "name": "voice",
+        "callback": "onGlassesVoice",
+        "scope": "document"
+      },
+      {
+        "name": "display",
+        "callback": "onGlassesDisplay",
+        "scope": "document"
+      },
+      {
+        "name": "audio",
+        "callback": "onGlassesAudio",
+        "scope": "document"
       }
     ]
   },
@@ -207,7 +668,9 @@
     "app": {
       "entry_type": "GlassesExtension",
       "sources": [
+        "ios/app/GlassesCapabilities.swift",
         "ios/app/GlassesCore.swift",
+        "ios/app/GlassesDisplay.swift",
         "ios/app/GlassesExtension.swift",
         "ios/app/GlassesMedia.swift",
         "ios/app/GlassesServer.swift"
@@ -223,12 +686,17 @@
       "packages": [
         "MWDATCore",
         "MWDATCamera",
+        "MWDATDisplay",
+        "MWDATInputs",
+        "MWDATMotion",
+        "MWDATSpeech",
         "MWDATMockDevice"
       ],
       "requires": {
         "usage_descriptions": [
           "NSBluetoothAlwaysUsageDescription",
-          "NSLocalNetworkUsageDescription"
+          "NSLocalNetworkUsageDescription",
+          "NSMicrophoneUsageDescription"
         ]
       },
       "custom_keys": true,
@@ -268,6 +736,10 @@
         "products": [
           "MWDATCore",
           "MWDATCamera",
+          "MWDATDisplay",
+          "MWDATInputs",
+          "MWDATMotion",
+          "MWDATSpeech",
           "MWDATMockDevice"
         ],
         "remote": {
@@ -313,6 +785,7 @@
         "namespace": "despia.ext.metaglasses",
         "sources": [
           "android/glasses/java/despia/ext/metaglasses/DatInterop.java",
+          "android/glasses/java/despia/ext/metaglasses/GlassesCapabilities.java",
           "android/glasses/java/despia/ext/metaglasses/GlassesCore.java",
           "android/glasses/java/despia/ext/metaglasses/GlassesExtension.java",
           "android/glasses/java/despia/ext/metaglasses/GlassesMedia.java",
@@ -325,6 +798,10 @@
           "com.meta.wearable:mwdat-core:1.1.0",
           "com.meta.wearable:mwdat-camera:1.1.0",
           "com.meta.wearable:mwdat-mockdevice:1.1.0",
+          "com.meta.wearable:mwdat-speech:1.1.0",
+          "com.meta.wearable:mwdat-motion:1.1.0",
+          "com.meta.wearable:mwdat-inputs:1.1.0",
+          "com.meta.wearable:mwdat-display:1.1.0",
           "androidx.activity:activity:1.13.0"
         ]
       }

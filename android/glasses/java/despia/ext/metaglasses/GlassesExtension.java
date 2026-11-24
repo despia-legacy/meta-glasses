@@ -6,6 +6,9 @@ import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
+import android.media.AudioDeviceCallback;
+import android.media.AudioDeviceInfo;
+import android.media.AudioManager;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Handler;
@@ -24,6 +27,14 @@ import com.despia.nativeext.NativeExtension;
 import com.meta.wearable.dat.camera.Camera;
 import com.meta.wearable.dat.camera.SessionCameraExtensionsKt;
 import com.meta.wearable.dat.camera.Stream;
+import com.meta.wearable.dat.camera.photo.Photo;
+import com.meta.wearable.dat.camera.photo.types.PhotoCaptureData;
+import com.meta.wearable.dat.camera.photo.types.PhotoError;
+import com.meta.wearable.dat.camera.photo.types.PhotoQuality;
+import com.meta.wearable.dat.camera.photo.types.PhotoResolution;
+import com.meta.wearable.dat.camera.types.AudioCodec;
+import com.meta.wearable.dat.camera.types.AudioFrame;
+import com.meta.wearable.dat.camera.types.AudioSampleRate;
 import com.meta.wearable.dat.camera.types.CaptureError;
 import com.meta.wearable.dat.camera.types.PhotoData;
 import com.meta.wearable.dat.camera.types.StreamConfiguration;
@@ -32,18 +43,30 @@ import com.meta.wearable.dat.camera.types.StreamState;
 import com.meta.wearable.dat.camera.types.VideoFrame;
 import com.meta.wearable.dat.camera.types.VideoQuality;
 import com.meta.wearable.dat.core.Wearables;
+import com.meta.wearable.dat.core.registration.RegistrationRequest;
+import com.meta.wearable.dat.core.registration.RegistrationRequestError;
 import com.meta.wearable.dat.core.selectors.AutoDeviceSelector;
+import com.meta.wearable.dat.core.selectors.DeviceSelector;
+import com.meta.wearable.dat.core.selectors.SpecificDeviceSelector;
 import com.meta.wearable.dat.core.session.DeviceSession;
 import com.meta.wearable.dat.core.session.DeviceSessionState;
 import com.meta.wearable.dat.core.types.DatError;
 import com.meta.wearable.dat.core.types.DatResult;
+import com.meta.wearable.dat.core.types.DeviceIdentifier;
 import com.meta.wearable.dat.core.types.DeviceSessionError;
+import com.meta.wearable.dat.core.types.NavigationError;
 import com.meta.wearable.dat.core.types.Permission;
 import com.meta.wearable.dat.core.types.PermissionError;
 import com.meta.wearable.dat.core.types.PermissionStatus;
 import com.meta.wearable.dat.core.types.RegistrationError;
 import com.meta.wearable.dat.core.types.RegistrationState;
+import com.meta.wearable.dat.core.types.ThermalLevel;
+import com.meta.wearable.dat.core.types.ChargingState;
 import com.meta.wearable.dat.core.types.WearablesError;
+import com.meta.wearable.dat.inputs.types.ButtonType;
+import com.meta.wearable.dat.inputs.types.CapturePressType;
+import com.meta.wearable.dat.inputs.types.DragAction;
+import com.meta.wearable.dat.inputs.types.InputSource;
 import com.meta.wearable.dat.mockdevice.MockDeviceKit;
 import com.meta.wearable.dat.mockdevice.api.GlassesModel;
 import com.meta.wearable.dat.mockdevice.api.MockDeviceKitConfig;
@@ -60,6 +83,8 @@ import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.nio.ByteBuffer;
 import java.security.SecureRandom;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -67,7 +92,12 @@ import java.util.concurrent.Executors;
 import kotlinx.coroutines.CoroutineScope;
 
 /**
- * Meta Ray-Ban glasses camera through Meta's Wearables Device Access Toolkit (DAT) 1.1.0.
+ * Meta's AI glasses through Meta's Wearables Device Access Toolkit (DAT) 1.1.0: registration with
+ * the Meta AI app, devices and their state, camera and microphone permissions, one shared device
+ * session, the camera stream with optional audio, in-stream and high-quality photos, clips,
+ * speech, motion, inputs, voice invocations, the glasses display, Bluetooth audio routing, update
+ * prompts and the Mock Device Kit. The capabilities beside the camera are in
+ * {@link GlassesCapabilities}; every word and error code is the same as on iOS.
  *
  * <p>The page starts and stops the glasses' camera stream and shows it from a loopback URL
  * ({@link GlassesServer}): {@code <img src=live>} is a multipart JPEG stream that always carries
@@ -131,11 +161,52 @@ public final class GlassesExtension implements NativeExtension {
     private boolean mock;
     private MockGlasses mockGlasses;
 
+    /** The one DeviceSession every capability shares (camera, speech, motion, inputs, display). */
+    private CoroutineScope sessionScope;
+    private DeviceSelector sessionSelector;
+    private final List<Waiter> sessionWaiters = new ArrayList<>();
+    private ExtResult sessionFailure;
+    private String lastSessionState = "idle";
+    private RegistrationRequest registrationRequest;
+    private GlassesCapabilities.Devices devices;
+    private GlassesCapabilities.Sensors sensors;
+    private GlassesCapabilities.Screen screen;
+    private boolean audio;
+    private int audioRate = 16000;
+    private int audioChannels = 1;
+    private Photo cameraPhoto;
+    private CoroutineScope photoScope;
+    private ExtResult.Callback stillReply;
+    private Object stillTimeout;
+    private String stillResolution;
+    private String stillQuality;
+    private AudioManager audioManager;
+    private AudioDeviceCallback audioCallback;
+    private Integer savedAudioMode;
+
+    /** Waits for the shared session to reach STARTED. */
+    private interface Ready {
+        void ready(DeviceSession s);
+    }
+
+    private static final class Waiter {
+        final ExtCall call;
+        final ExtResult.Callback reply;
+        final Ready ready;
+
+        Waiter(ExtCall call, ExtResult.Callback reply, Ready ready) {
+            this.call = call;
+            this.reply = reply;
+            this.ready = ready;
+        }
+    }
+
     private static final class Call {
         final ExtCall call;
         final ExtResult.Callback reply;
         final long gen;
         boolean prompt;
+        Permission asked = Permission.CAMERA;
 
         Call(ExtCall call, ExtResult.Callback reply, long gen) {
             this.call = call;
@@ -148,6 +219,10 @@ public final class GlassesExtension implements NativeExtension {
     public void onCreate(ExtContext context) {
         ctx = context;
         mediaDir = new File(context.dataDir(), "media");
+        GlassesCapabilities.Emit emit = (event, data) -> ctx.emit(event, data);
+        devices = new GlassesCapabilities.Devices(emit);
+        sensors = new GlassesCapabilities.Sensors(emit);
+        screen = new GlassesCapabilities.Screen(emit);
     }
 
     @Override
@@ -179,12 +254,18 @@ public final class GlassesExtension implements NativeExtension {
     /**
      * The Meta AI app returns to the app on its own scheme after registration. Wearables tracks
      * the result itself (registration flows through its service); handleIntent passes a
-     * registration request on, when the intent carries one.
+     * registration request on, when the intent carries one: it reaches the page as the
+     * registration_request event, answered with registration_continue or registration_cancel.
      */
     @Override
     public boolean onIntent(Activity a, Intent intent) {
         if (!bluetoothGranted() || !ensureInit()) return false;
-        DatResult<Boolean, ?> r = Wearables.INSTANCE.handleIntent(intent, request -> kotlin.Unit.INSTANCE);
+        DatResult<Boolean, ?> r = Wearables.INSTANCE.handleIntent(intent, request -> {
+            registrationRequest = request;
+            ctx.emit("registration_request", GlassesCapabilities.obj("flowId", request.getFlowId(),
+                    "protocolVersion", request.getProtocolVersion()));
+            return kotlin.Unit.INSTANCE;
+        });
         Boolean handled = r.getOrNull();
         return handled != null && handled;
     }
@@ -192,7 +273,8 @@ public final class GlassesExtension implements NativeExtension {
     @Override
     public void handle(ExtCall call, ExtResult.Callback reply) {
         try {
-            if ("mock".equals(call.route) && (ctx.app().getApplicationInfo().flags & ApplicationInfo.FLAG_DEBUGGABLE) == 0) {
+            if (("mock".equals(call.route) || "mock_event".equals(call.route))
+                    && (ctx.app().getApplicationInfo().flags & ApplicationInfo.FLAG_DEBUGGABLE) == 0) {
                 reply.reply(ExtResult.error("mock_unavailable", "the mock glasses run in debug builds only"));
                 return;
             }
@@ -210,6 +292,14 @@ public final class GlassesExtension implements NativeExtension {
                 case "media_read":
                 case "media_delete":
                 case "stop":
+                case "session_stop":
+                case "speech_stop":
+                case "motion_stop":
+                case "inputs_stop":
+                case "display_stop":
+                case "display_video_stop":
+                case "voice_stop":
+                case "audio_route":
                     break;
                 default:
                     if (!bluetoothGranted()) {
@@ -237,7 +327,11 @@ public final class GlassesExtension implements NativeExtension {
                     reply.reply(ExtResult.ok(status()));
                     return;
                 case "photo":
-                    photo(reply);
+                    if (call.params.get("resolution") != null || call.params.get("quality") != null) {
+                        stillPhoto(call, reply);
+                    } else {
+                        photo(reply);
+                    }
                     return;
                 case "record_start":
                     recordStart(call, reply);
@@ -260,6 +354,82 @@ public final class GlassesExtension implements NativeExtension {
                 case "mock":
                     mock(call, reply);
                     return;
+                case "mock_event":
+                    mockEvent(call, reply);
+                    return;
+                case "devices":
+                    reply.reply(ExtResult.ok(new JSONObject().put("devices", devices.list())));
+                    return;
+                case "session_start":
+                    openSession(call, reply, str(call, "device"), s -> replyStatus(reply));
+                    return;
+                case "session_stop":
+                    endSession("stopped");
+                    reply.reply(ExtResult.ok(status()));
+                    return;
+                case "pause":
+                case "resume":
+                    pauseResume(call.route.equals("pause"), reply);
+                    return;
+                case "registration_continue":
+                case "registration_cancel":
+                    registrationAnswer(call, reply);
+                    return;
+                case "open_update":
+                    openUpdate(call, reply);
+                    return;
+                case "audio_route":
+                    audioRoute(call, reply);
+                    return;
+                case "speech_start":
+                case "motion_start":
+                case "inputs_start":
+                case "display_start":
+                    capabilityStart(call, reply);
+                    return;
+                case "speech_stop":
+                    reply.reply(sensors.speechStop(session));
+                    releaseSessionIfIdle();
+                    return;
+                case "motion_stop":
+                    reply.reply(sensors.motionStop(session));
+                    releaseSessionIfIdle();
+                    return;
+                case "inputs_stop":
+                    reply.reply(sensors.inputsStop(session));
+                    releaseSessionIfIdle();
+                    return;
+                case "display_stop":
+                    reply.reply(screen.stop(session));
+                    releaseSessionIfIdle();
+                    return;
+                case "display_send":
+                    screen.send(str(call, "content"), reply);
+                    return;
+                case "display_video":
+                    String url = str(call, "url");
+                    if (url == null || !url.startsWith("https://")) {
+                        reply.reply(ExtResult.error("bad_request", "url must be an https URL"));
+                        return;
+                    }
+                    screen.video(url, reply);
+                    return;
+                case "display_video_stop":
+                    reply.reply(screen.videoStop());
+                    return;
+                case "display_clear":
+                    screen.clear(reply);
+                    return;
+                case "voice_start":
+                    voiceStart(call, reply);
+                    return;
+                case "voice_stop":
+                    reply.reply(sensors.voiceStop());
+                    return;
+                case "voice_respond":
+                    sensors.voiceRespond(str(call, "id") == null ? "" : str(call, "id"), !Boolean.FALSE.equals(call.params.get("success")),
+                            str(call, "output"), reply);
+                    return;
                 default:
                     reply.reply(ExtResult.error("bad_request", "unknown route"));
             }
@@ -280,6 +450,7 @@ public final class GlassesExtension implements NativeExtension {
         }
         initialized = true;
         appScope = DatInterop.mainScope();
+        devices.start(appScope);
         DatInterop.collect(appScope, Wearables.INSTANCE.getRegistrationState(), s -> {
             try {
                 ctx.emit("registration", new JSONObject().put("registration", name(s)));
@@ -321,6 +492,16 @@ public final class GlassesExtension implements NativeExtension {
         o.put("clip", core.clip == null ? JSONObject.NULL : core.clip);
         o.put("photoBusy", photoBusy);
         o.put("mock", mock);
+        o.put("session", session == null ? "none" : GlassesCapabilities.word(session.getState().getValue()));
+        o.put("device", sessionDeviceId() == null ? JSONObject.NULL : sessionDeviceId());
+        o.put("audio", audio);
+        o.put("audioRate", audioRate);
+        o.put("audioChannels", audioChannels);
+        o.put("speech", sensors.speech != null);
+        o.put("motion", sensors.motion != null);
+        o.put("inputs", sensors.inputs != null);
+        o.put("display", screen.active());
+        o.put("voice", sensors.voiceState());
         if (server != null) {
             o.put("live", server.base() + "/live.mjpg");
             o.put("frame", server.base() + "/frame.jpg");
@@ -362,10 +543,11 @@ public final class GlassesExtension implements NativeExtension {
         }
         Call w = new Call(call, reply, 0);
         w.prompt = Boolean.TRUE.equals(call.params.get("prompt"));
+        w.asked = "microphone".equals(call.params.get("kind")) ? Permission.MICROPHONE : Permission.CAMERA;
         permissionWait = w;
         if (!bluetoothGranted()) {
             if (!w.prompt) {
-                finishPermission(w, okPermission("denied", "unknown"));
+                finishPermission(w, okPermission("denied", "unknown", "unknown"));
             } else if (bluetoothLauncher == null) {
                 finishPermission(w, ExtResult.error("unavailable", "no activity is showing"));
             } else {
@@ -395,34 +577,35 @@ public final class GlassesExtension implements NativeExtension {
                 || ctx.app().checkSelfPermission(BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED;
     }
 
+    /** The glasses' camera and microphone permissions (granted in the Meta AI app); kind picks the one a prompt asks for. */
     private void checkCamera(Call w) {
         if (!ensureInit()) {
             finishPermission(w, ExtResult.error("init_failed", "the glasses SDK could not start"));
             return;
         }
         if (Wearables.INSTANCE.getRegistrationState().getValue() != RegistrationState.REGISTERED) {
-            // The camera permission belongs to a registered app; Meta AI cannot answer it before.
-            finishPermission(w, okPermission("granted", "unknown"));
+            // The glasses permissions belong to a registered app; Meta AI cannot answer them before.
+            finishPermission(w, okPermission("granted", "unknown", "unknown"));
             return;
         }
         DatInterop.<DatResult<PermissionStatus, PermissionError>>call(
-                c -> Wearables.INSTANCE.checkPermissionStatus(Permission.CAMERA, c), (r, error) -> {
+                c -> Wearables.INSTANCE.checkPermissionStatus(w.asked, c), (r, error) -> {
                     if (permissionWait != w) return;
                     if (error != null || r == null) {
                         finishPermission(w, ExtResult.error("permission_failed", "the permission check failed"));
                     } else if (!r.isSuccess()) {
                         finishPermission(w, permissionError(r.errorOrNull()));
                     } else if (r.getOrNull() instanceof PermissionStatus.Granted) {
-                        finishPermission(w, okPermission("granted", "granted"));
+                        finishWithOther(w, "granted");
                     } else if (!w.prompt) {
-                        finishPermission(w, okPermission("granted", "denied"));
+                        finishWithOther(w, "denied");
                     } else if (!w.call.isActive()) {
                         finishPermission(w, ExtResult.error("timeout", "the permission check took too long"));
                     } else if (permissionLauncher == null) {
                         finishPermission(w, ExtResult.error("unavailable", "no activity is showing"));
                     } else {
                         // Switches to the Meta AI app; the answer comes back to onPermissionResult.
-                        permissionLauncher.launch(Permission.CAMERA);
+                        permissionLauncher.launch(w.asked);
                     }
                 });
     }
@@ -433,8 +616,20 @@ public final class GlassesExtension implements NativeExtension {
         if (r == null || !r.isSuccess()) {
             finishPermission(w, r == null ? ExtResult.error("permission_failed", "no answer") : permissionError(r.errorOrNull()));
         } else {
-            finishPermission(w, okPermission("granted", r.getOrNull() instanceof PermissionStatus.Granted ? "granted" : "denied"));
+            finishWithOther(w, r.getOrNull() instanceof PermissionStatus.Granted ? "granted" : "denied");
         }
+    }
+
+    /** Reads the permission that was not asked, so both are reported. */
+    private void finishWithOther(Call w, String askedWord) {
+        Permission other = w.asked == Permission.CAMERA ? Permission.MICROPHONE : Permission.CAMERA;
+        DatInterop.<DatResult<PermissionStatus, PermissionError>>call(
+                c -> Wearables.INSTANCE.checkPermissionStatus(other, c), (r, error) -> {
+                    String o = error != null || r == null || !r.isSuccess() ? "unknown"
+                            : r.getOrNull() instanceof PermissionStatus.Granted ? "granted" : "denied";
+                    boolean cam = w.asked == Permission.CAMERA;
+                    finishPermission(w, okPermission("granted", cam ? askedWord : o, cam ? o : askedWord));
+                });
     }
 
     private void finishPermission(Call w, ExtResult result) {
@@ -442,9 +637,9 @@ public final class GlassesExtension implements NativeExtension {
         w.reply.reply(result);
     }
 
-    private static ExtResult okPermission(String bluetooth, String camera) {
+    private static ExtResult okPermission(String bluetooth, String camera, String microphone) {
         try {
-            return ExtResult.ok(new JSONObject().put("bluetooth", bluetooth).put("camera", camera));
+            return ExtResult.ok(new JSONObject().put("bluetooth", bluetooth).put("camera", camera).put("microphone", microphone));
         } catch (JSONException e) {
             return ExtResult.error("handler_error", "could not build the reply");
         }
@@ -475,67 +670,414 @@ public final class GlassesExtension implements NativeExtension {
         Object f = call.params.get("fps");
         String wantQuality = q instanceof String ? (String) q : "medium";
         int wantFps = GlassesCore.frameRate(f instanceof Number ? ((Number) f).intValue() : 24);
+        Object ch = call.params.get("audio_channels");
         try {
             if (server == null) server = GlassesServer.start(mediaDir());
         } catch (IOException e) {
             reply.reply(ExtResult.error("server_failed", "the local stream server could not start"));
             return;
         }
-        DatResult<DeviceSession, DeviceSessionError> r = Wearables.INSTANCE.createSession(new AutoDeviceSelector());
-        if (!r.isSuccess()) {
-            reply.reply(sessionError(r.errorOrNull()));
-            return;
-        }
         long g = core.begin();
         quality = wantQuality;
         fps = wantFps;
+        audio = Boolean.TRUE.equals(call.params.get("audio"));
+        audioRate = "48000".equals(call.params.get("audio_rate")) ? 48000 : "44100".equals(call.params.get("audio_rate")) ? 44100 : 16000;
+        audioChannels = ch instanceof Number ? Math.max(1, Math.min(2, ((Number) ch).intValue())) : 1;
         frameWidth = 0;
         frameHeight = 0;
-        session = r.getOrNull();
         streamSeenActive = false;
         Call s = new Call(call, reply, g);
         starting = s;
         streamScope = DatInterop.mainScope();
         frameScope = DatInterop.backgroundScope();
-        DatInterop.collect(streamScope, session.getErrors(), e -> onSessionError(g, e));
-        DatInterop.collect(streamScope, session.getState(), st -> onSessionState(g, st));
-        session.start();
         long at = call.deadlineUptimeMillis > 0 ? call.deadlineUptimeMillis - 100 : SystemClock.uptimeMillis() + 20000;
         main.postAtTime(() -> {
             if (starting == s) failStart(s, ExtResult.error("timeout", "the glasses did not start streaming in time"));
         }, startTimeout, at);
         emitState("starting");
+        openSession(call, r -> failStart(s, r), str(call, "device"), sess -> attachCamera(g, sess));
     }
 
-    private void onSessionState(long g, DeviceSessionState st) {
-        if (g != core.gen || session == null) return;
-        if (st == DeviceSessionState.STARTED && camera == null) {
-            VideoQuality vq = quality.equals("high") ? VideoQuality.HIGH : quality.equals("low") ? VideoQuality.LOW : VideoQuality.MEDIUM;
-            // Decoded YUV frames (compressVideo false): the preview needs no decoder of its own.
-            DatResult<Camera, DeviceSessionError> c = SessionCameraExtensionsKt.addCamera(session,
-                    new StreamConfiguration(null, vq, fps, false));
-            if (!c.isSuccess()) {
-                failStartOrEnd(g, sessionError(c.errorOrNull()), "camera_failed");
+    /** The session is started: the camera is added (a capability needs a started session). */
+    private void attachCamera(long g, DeviceSession s) {
+        if (g != core.gen || core.state.equals("idle") || camera != null) {
+            releaseSessionIfIdle();
+            return;
+        }
+        VideoQuality vq = quality.equals("high") ? VideoQuality.HIGH : quality.equals("low") ? VideoQuality.LOW : VideoQuality.MEDIUM;
+        // Camera audio (DAT 1.0.0, experimental): PCM at 16, 44.1 or 48 kHz beside the video, into clips.
+        AudioCodec codec = audio ? new AudioCodec.PCM(audioRate == 48000 ? AudioSampleRate.RATE_48000
+                : audioRate == 44100 ? AudioSampleRate.RATE_44100 : AudioSampleRate.RATE_16000, audioChannels) : null;
+        // Decoded YUV frames (compressVideo false): the preview needs no decoder of its own.
+        DatResult<Camera, DeviceSessionError> c = SessionCameraExtensionsKt.addCamera(s, new StreamConfiguration(codec, vq, fps, false));
+        if (!c.isSuccess() || c.getOrNull() == null) {
+            failStartOrEnd(g, GlassesCapabilities.session(c.errorOrNull()), "camera_failed");
+            return;
+        }
+        camera = c.getOrNull();
+        stream = camera.getStream();
+        liveGen = g;
+        DatInterop.collect(streamScope, stream.getState(), x -> onStreamState(g, x));
+        DatInterop.collect(streamScope, stream.getErrorStream(), x -> onStreamError(g, x));
+        DatInterop.collect(frameScope, stream.getVideoStream(), x -> onFrame(g, x));
+        if (audio) DatInterop.collect(frameScope, stream.getAudioStream(), x -> onAudio(g, x));
+        DatResult<kotlin.Unit, StreamError> sr = stream.start();
+        if (!sr.isSuccess()) failStartOrEnd(g, streamError(sr.errorOrNull()), "stream_failed");
+    }
+
+    // ------------------------------------------------------------------------ device session
+
+    private String sessionDeviceId() {
+        DeviceSelector sel = sessionSelector;
+        DeviceIdentifier id = sel == null ? null : sel.activeDevice();
+        return id == null ? null : id.getIdentifier();
+    }
+
+    /**
+     * The one DeviceSession every capability shares. ready runs once it is started; fail gets the
+     * error otherwise. device picks a device by id (SpecificDeviceSelector); without it DAT's
+     * AutoDeviceSelector picks one.
+     */
+    private void openSession(ExtCall call, ExtResult.Callback fail, String device, Ready ready) {
+        if (Wearables.INSTANCE.getRegistrationState().getValue() != RegistrationState.REGISTERED) {
+            fail.reply(ExtResult.error("registration_required", "connect the app to Meta AI first (register)"));
+            return;
+        }
+        if (session != null) {
+            String cur = sessionDeviceId();
+            if (device != null && cur != null && !device.equals(cur)) {
+                fail.reply(ExtResult.error("busy", "a session with another device is open (session_stop first)"));
                 return;
             }
-            camera = c.getOrNull();
-            stream = camera.getStream();
-            liveGen = g;
-            DatInterop.collect(streamScope, stream.getState(), x -> onStreamState(g, x));
-            DatInterop.collect(streamScope, stream.getErrorStream(), x -> onStreamError(g, x));
-            DatInterop.collect(frameScope, stream.getVideoStream(), x -> onFrame(g, x));
-            DatResult<kotlin.Unit, StreamError> sr = stream.start();
-            if (!sr.isSuccess()) failStartOrEnd(g, streamError(sr.errorOrNull()), "stream_failed");
-        } else if (st == DeviceSessionState.STOPPED && streamSeenActive) {
-            ended(g, "session_stopped");
-        } else if (st == DeviceSessionState.STOPPED && starting != null && starting.gen == g) {
-            failStart(starting, ExtResult.error("no_device", "the glasses session stopped before streaming"));
+            DeviceSessionState st = session.getState().getValue();
+            if (st == DeviceSessionState.STARTED || st == DeviceSessionState.PAUSED) {
+                ready.ready(session);
+            } else {
+                addWaiter(call, fail, ready);
+            }
+            return;
+        }
+        DeviceSelector sel = device == null ? new AutoDeviceSelector() : new SpecificDeviceSelector(new DeviceIdentifier(device));
+        DatResult<DeviceSession, DeviceSessionError> r = Wearables.INSTANCE.createSession(sel);
+        if (!r.isSuccess() || r.getOrNull() == null) {
+            fail.reply(GlassesCapabilities.session(r.errorOrNull()));
+            return;
+        }
+        DeviceSession s = r.getOrNull();
+        session = s;
+        sessionSelector = sel;
+        sessionFailure = null;
+        sessionScope = DatInterop.mainScope();
+        addWaiter(call, fail, ready);
+        DatInterop.collect(sessionScope, s.getErrors(), e -> onSessionError(s, e));
+        DatInterop.collect(sessionScope, s.getState(), st -> onSessionState(s, st));
+        s.start();
+    }
+
+    private void addWaiter(ExtCall call, ExtResult.Callback fail, Ready ready) {
+        Waiter w = new Waiter(call, fail, ready);
+        sessionWaiters.add(w);
+        long at = call.deadlineUptimeMillis > 0 ? call.deadlineUptimeMillis - 100 : SystemClock.uptimeMillis() + 20000;
+        main.postAtTime(() -> {
+            if (!sessionWaiters.remove(w)) return;
+            w.reply.reply(ExtResult.error("timeout", "the glasses did not connect in time"));
+            releaseSessionIfIdle();
+        }, w, at);
+    }
+
+    private void failWaiters(ExtResult why) {
+        List<Waiter> ws = new ArrayList<>(sessionWaiters);
+        sessionWaiters.clear();
+        for (Waiter w : ws) {
+            main.removeCallbacksAndMessages(w);
+            w.reply.reply(why);
         }
     }
 
-    private void onSessionError(long g, DeviceSessionError e) {
-        if (g != core.gen) return;
-        failStartOrEnd(g, sessionError(e), "session_error");
+    private void onSessionState(DeviceSession s, DeviceSessionState st) {
+        if (s != session) return;
+        lastSessionState = GlassesCapabilities.word(st);
+        ctx.emit("session", GlassesCapabilities.obj("state", lastSessionState, "device", sessionDeviceId()));
+        if (st == DeviceSessionState.STARTED) {
+            List<Waiter> ws = new ArrayList<>(sessionWaiters);
+            sessionWaiters.clear();
+            for (Waiter w : ws) {
+                main.removeCallbacksAndMessages(w);
+                if (session == s) w.ready.ready(s);
+            }
+        } else if (st == DeviceSessionState.STOPPED) {
+            // The SDK ended the session: cleared first, so the camera's end releases nothing again.
+            session = null;
+            ExtResult why = sessionFailure != null ? sessionFailure
+                    : ExtResult.error("no_device", "the glasses session stopped before it started");
+            failWaiters(why);
+            long g = core.gen;
+            if (!core.state.equals("idle")) {
+                if (streamSeenActive) {
+                    ended(g, "session_stopped");
+                } else {
+                    failStartOrEnd(g, sessionFailure != null ? sessionFailure
+                            : ExtResult.error("no_device", "the glasses session stopped before streaming"), "start_failed");
+                }
+            }
+            sensors.sessionEnded();
+            screen.sessionEnded();
+            sessionSelector = null;
+            CoroutineScope sc = sessionScope;
+            sessionScope = null;
+            DatInterop.cancel(sc);
+        }
+    }
+
+    private void onSessionError(DeviceSession s, DeviceSessionError e) {
+        if (s != session) return;
+        ctx.emit("session", GlassesCapabilities.obj("state", GlassesCapabilities.word(s.getState().getValue()),
+                "device", sessionDeviceId(), "error", GlassesCapabilities.sessionCode(e), "message", describe(e)));
+        // DAT 1.0.0: an app built with an SDK outside the glasses' supported range keeps working;
+        // the warning only suggests an update.
+        if (e == DeviceSessionError.DWA_OUT_OF_STU_RANGE) return;
+        sessionFailure = GlassesCapabilities.session(e);
+        if (!core.state.equals("idle")) failStartOrEnd(core.gen, sessionFailure, "session_error");
+    }
+
+    /** Ends the session and every capability on it. */
+    private void endSession(String reason) {
+        DeviceSession s = session;
+        String device = sessionDeviceId();
+        // Cleared first: the camera's teardown below then finds no session to release again.
+        session = null;
+        CoroutineScope sc = sessionScope;
+        sessionScope = null;
+        DatInterop.cancel(sc);
+        teardown(reason);
+        sensors.sessionEnded();
+        screen.sessionEnded();
+        failWaiters(ExtResult.error("no_device", "the glasses session was stopped"));
+        sessionSelector = null;
+        if (s == null) return;
+        s.stop();
+        lastSessionState = "stopped";
+        ctx.emit("session", GlassesCapabilities.obj("state", "stopped", "device", device, "reason", reason));
+    }
+
+    /** The camera, speech, motion, inputs and display are all off: the session has no work left. */
+    private void releaseSessionIfIdle() {
+        if (session == null || camera != null || !core.state.equals("idle") || !sessionWaiters.isEmpty()
+                || sensors.active() || screen.active()) {
+            return;
+        }
+        endSession("idle");
+    }
+
+    private void pauseResume(boolean pause, ExtResult.Callback reply) throws JSONException {
+        if (session == null) {
+            reply.reply(ExtResult.error("not_active", "no glasses session is open"));
+            return;
+        }
+        // DAT 1.1.0: pause() outside started and resume() outside paused do nothing.
+        if (pause) session.pause(); else session.resume();
+        reply.reply(ExtResult.ok(new JSONObject().put("session", GlassesCapabilities.word(session.getState().getValue()))
+                .put("device", sessionDeviceId() == null ? JSONObject.NULL : sessionDeviceId())));
+    }
+
+    private void capabilityStart(ExtCall call, ExtResult.Callback reply) {
+        openSession(call, reply, str(call, "device"), s -> {
+            ExtResult r;
+            switch (call.route) {
+                case "speech_start":
+                    r = sensors.speechStart(s);
+                    break;
+                case "motion_start":
+                    int hz;
+                    try {
+                        hz = Integer.parseInt(str(call, "rate") == null ? "10" : str(call, "rate"));
+                    } catch (NumberFormatException e) {
+                        hz = 10;
+                    }
+                    r = sensors.motionStart(s, hz);
+                    break;
+                case "inputs_start":
+                    r = sensors.inputsStart(s, str(call, "sources"), !Boolean.FALSE.equals(call.params.get("consume_back")));
+                    break;
+                default:
+                    r = screen.start(s);
+            }
+            if (!r.isOk()) releaseSessionIfIdle();
+            reply.reply(r);
+        });
+    }
+
+    private void voiceStart(ExtCall call, ExtResult.Callback reply) {
+        if (Wearables.INSTANCE.getRegistrationState().getValue() != RegistrationState.REGISTERED) {
+            reply.reply(ExtResult.error("registration_required", "connect the app to Meta AI first (register)"));
+            return;
+        }
+        String device = str(call, "device");
+        if (device == null) device = sessionDeviceId();
+        if (device == null) {
+            for (DeviceIdentifier id : Wearables.INSTANCE.getDevices().getValue()) {
+                device = id.getIdentifier();
+                break;
+            }
+        }
+        if (device == null) {
+            reply.reply(ExtResult.error("no_device", "no glasses are connected"));
+            return;
+        }
+        reply.reply(sensors.voiceStart(device));
+    }
+
+    // ----------------------------------------------------- registration requests and updates
+
+    private void registrationAnswer(ExtCall call, ExtResult.Callback reply) throws JSONException {
+        RegistrationRequest r = registrationRequest;
+        if (r == null) {
+            reply.reply(ExtResult.error("not_found", "no registration request from Meta AI is open"));
+            return;
+        }
+        boolean go = call.route.equals("registration_continue");
+        if (go && activity == null) {
+            reply.reply(ExtResult.error("unavailable", "no activity is showing"));
+            return;
+        }
+        registrationRequest = null;
+        // Android's cancelRegistration has no returnToMetaAI choice (DAT 1.1.0): Meta AI decides.
+        DatResult<kotlin.Unit, RegistrationRequestError> out = go ? r.continueRegistration(activity) : r.cancelRegistration();
+        if (!out.isSuccess()) {
+            RegistrationRequestError e = out.errorOrNull();
+            String code = e == RegistrationRequestError.INVALID_REQUEST || e == RegistrationRequestError.ALREADY_HANDLED
+                    ? "not_found" : "registration_failed";
+            reply.reply(ExtResult.error(code, describe(e)));
+            return;
+        }
+        reply.reply(ExtResult.ok(new JSONObject().put("flowId", r.getFlowId()).put("answer", go ? "continue" : "cancel")));
+    }
+
+    private void openUpdate(ExtCall call, ExtResult.Callback reply) throws JSONException {
+        if (activity == null) {
+            reply.reply(ExtResult.error("unavailable", "no activity is showing"));
+            return;
+        }
+        String target = "glasses_app".equals(call.params.get("target")) ? "glasses_app" : "firmware";
+        DatResult<kotlin.Unit, NavigationError> r = target.equals("glasses_app")
+                ? Wearables.INSTANCE.openDATGlassesAppUpdate(activity) : Wearables.INSTANCE.openFirmwareUpdate(activity);
+        if (!r.isSuccess()) {
+            NavigationError e = r.errorOrNull();
+            reply.reply(ExtResult.error(e == NavigationError.META_AI_NOT_INSTALLED ? "meta_ai_missing"
+                    : e == NavigationError.NOT_REGISTERED ? "registration_required" : "unavailable", describe(e)));
+            return;
+        }
+        reply.reply(ExtResult.ok(new JSONObject().put("opened", target)));
+    }
+
+    // -------------------------------------------------------------------------- Bluetooth audio
+
+    /**
+     * Routes the app's audio to the glasses over Bluetooth: call uses the communication device
+     * (Hands-Free: the glasses' microphones and speakers, for getUserMedia and calls), media
+     * leaves media on its default route (A2DP to the glasses when they are connected), default
+     * puts back the mode the app had. DAT itself carries no phone audio; Meta's glasses are
+     * standard Bluetooth audio devices.
+     */
+    @SuppressWarnings("deprecation")
+    private void audioRoute(ExtCall call, ExtResult.Callback reply) throws JSONException {
+        String mode = str(call, "mode") == null ? "call" : str(call, "mode");
+        AudioManager am = audioManager();
+        if (am == null) {
+            reply.reply(ExtResult.error("audio_failed", "no audio service"));
+            return;
+        }
+        // The Despia base app declares MODIFY_AUDIO_SETTINGS (a normal permission, granted at
+        // install); a typed extension module may not add it, so check it rather than crash.
+        if (!"default".equals(mode) && ctx.app().checkSelfPermission("android.permission.MODIFY_AUDIO_SETTINGS")
+                != PackageManager.PERMISSION_GRANTED) {
+            reply.reply(ExtResult.error("permission_denied", "the app does not declare MODIFY_AUDIO_SETTINGS"));
+            return;
+        }
+        try {
+            if (mode.equals("default") || mode.equals("media")) {
+                if (Build.VERSION.SDK_INT >= 31) {
+                    am.clearCommunicationDevice();
+                } else {
+                    am.stopBluetoothSco();
+                    am.setBluetoothScoOn(false);
+                }
+                if (savedAudioMode != null) am.setMode(savedAudioMode);
+                savedAudioMode = null;
+                if (mode.equals("default") && audioCallback != null) {
+                    am.unregisterAudioDeviceCallback(audioCallback);
+                    audioCallback = null;
+                }
+            } else {
+                if (savedAudioMode == null) savedAudioMode = am.getMode();
+                am.setMode(AudioManager.MODE_IN_COMMUNICATION);
+                if (Build.VERSION.SDK_INT >= 31) {
+                    for (AudioDeviceInfo d : am.getAvailableCommunicationDevices()) {
+                        int t = d.getType();
+                        if (t == AudioDeviceInfo.TYPE_BLUETOOTH_SCO || t == AudioDeviceInfo.TYPE_BLE_HEADSET) {
+                            am.setCommunicationDevice(d);
+                            break;
+                        }
+                    }
+                } else {
+                    am.startBluetoothSco();
+                    am.setBluetoothScoOn(true);
+                }
+            }
+            if (!mode.equals("default") && audioCallback == null) {
+                audioCallback = new AudioDeviceCallback() {
+                    @Override
+                    public void onAudioDevicesAdded(AudioDeviceInfo[] added) {
+                        ctx.emit("audio", audioState(am));
+                    }
+
+                    @Override
+                    public void onAudioDevicesRemoved(AudioDeviceInfo[] removed) {
+                        ctx.emit("audio", audioState(am));
+                    }
+                };
+                am.registerAudioDeviceCallback(audioCallback, main);
+            }
+        } catch (RuntimeException e) {
+            reply.reply(ExtResult.error("audio_failed", String.valueOf(e.getMessage())));
+            return;
+        }
+        reply.reply(ExtResult.ok(audioState(am).put("mode", mode)));
+    }
+
+    private AudioManager audioManager() {
+        if (audioManager == null) audioManager = (AudioManager) ctx.app().getSystemService(android.content.Context.AUDIO_SERVICE);
+        return audioManager;
+    }
+
+    private static boolean bluetooth(int type) {
+        return type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO || type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP
+                || type == AudioDeviceInfo.TYPE_BLE_HEADSET || type == AudioDeviceInfo.TYPE_BLE_SPEAKER;
+    }
+
+    /** The connected inputs and outputs, the same keys as iOS. */
+    private static JSONObject audioState(AudioManager am) {
+        JSONArray inputs = new JSONArray();
+        JSONArray outputs = new JSONArray();
+        boolean glasses = false;
+        for (AudioDeviceInfo d : am.getDevices(AudioManager.GET_DEVICES_INPUTS)) {
+            inputs.put(GlassesCapabilities.obj("name", String.valueOf(d.getProductName()), "type", d.getType(), "bluetooth", bluetooth(d.getType())));
+        }
+        for (AudioDeviceInfo d : am.getDevices(AudioManager.GET_DEVICES_OUTPUTS)) {
+            boolean bt = bluetooth(d.getType());
+            glasses |= bt;
+            outputs.put(GlassesCapabilities.obj("name", String.valueOf(d.getProductName()), "type", d.getType(), "bluetooth", bt));
+        }
+        JSONObject o = GlassesCapabilities.obj("inputs", inputs, "outputs", outputs, "glasses", glasses);
+        if (Build.VERSION.SDK_INT >= 31) {
+            AudioDeviceInfo c = am.getCommunicationDevice();
+            try {
+                o.put("communication", c == null ? JSONObject.NULL : String.valueOf(c.getProductName()));
+            } catch (JSONException ignored) {
+                // A plain key always sets.
+            }
+        }
+        return o;
     }
 
     private void onStreamState(long g, StreamState st) {
@@ -611,19 +1153,30 @@ public final class GlassesExtension implements NativeExtension {
         if (wasActive) emitState(reason);
     }
 
+    /** Ends the camera (its stream and photo). The session stays while another capability uses it. */
     private void stopSdk() {
         liveGen = 0;
         DatInterop.cancel(frameScope);
         DatInterop.cancel(streamScope);
+        DatInterop.cancel(photoScope);
         frameScope = null;
         streamScope = null;
-        // Camera.stop cascades to its stream; DeviceSession.stop to every capability.
+        photoScope = null;
+        cameraPhoto = null;
+        if (stillReply != null) finishStill(ExtResult.error("capture_failed", "the stream ended before the photo arrived"));
+        // Camera.stop cascades to its stream and photo.
         if (camera != null) camera.stop();
-        if (session != null) session.stop();
         camera = null;
         stream = null;
-        session = null;
         if (server != null) server.endLive();
+        releaseSessionIfIdle();
+    }
+
+    /** On the frame thread: the stream's PCM goes to an open clip only. */
+    private void onAudio(long g, AudioFrame f) {
+        if (g != liveGen) return;
+        GlassesMedia.ClipRecorder r = recorder;
+        if (r != null) r.offerAudio(f.getBuffer(), f.getPresentationTimeUs());
     }
 
     /** On the frame thread (Dispatchers.Default), one frame at a time. */
@@ -703,6 +1256,110 @@ public final class GlassesExtension implements NativeExtension {
         });
     }
 
+    /**
+     * A high-quality still through DAT's Camera photo capability (DAT 1.0.0, experimental): the
+     * glasses take the picture at resolution and quality and transfer it, reporting photo_progress.
+     */
+    private void stillPhoto(ExtCall call, ExtResult.Callback reply) {
+        if (!(core.state.equals("streaming") || core.state.equals("paused")) || camera == null) {
+            reply.reply(ExtResult.error("not_streaming", "start the stream first"));
+            return;
+        }
+        if (photoBusy) {
+            reply.reply(ExtResult.error("busy", "a photo is already being taken"));
+            return;
+        }
+        String res = str(call, "resolution") == null ? "medium" : str(call, "resolution");
+        String q = str(call, "quality") == null ? "medium" : str(call, "quality");
+        PhotoResolution pr = res.equals("small") ? PhotoResolution.SMALL : res.equals("large") ? PhotoResolution.LARGE
+                : res.equals("full") ? PhotoResolution.FULL : PhotoResolution.MEDIUM;
+        PhotoQuality pq = q.equals("low") ? PhotoQuality.LOW : q.equals("high") ? PhotoQuality.HIGH : PhotoQuality.MEDIUM;
+        if (cameraPhoto == null) {
+            Photo p = camera.getPhoto();
+            if (p == null) {
+                reply.reply(ExtResult.error("capture_failed", "the camera has no photo capability"));
+                return;
+            }
+            photoScope = DatInterop.mainScope();
+            DatInterop.collect(photoScope, p.getPhotoStream(), this::onStill);
+            DatInterop.collect(photoScope, p.getErrors(), (PhotoError e) -> {
+                if (e != null && stillReply != null) finishStill(photoError(e));
+            });
+            DatInterop.collect(photoScope, p.getTransferProgressStream(), t -> ctx.emit("photo_progress",
+                    GlassesCapabilities.obj("received", t.getBytesReceived(), "total", t.getTotalBytes(), "fraction", t.getFraction())));
+            cameraPhoto = p;
+        }
+        photoBusy = true;
+        stillReply = reply;
+        stillResolution = res;
+        stillQuality = q;
+        Object token = new Object();
+        stillTimeout = token;
+        long at = call.deadlineUptimeMillis > 0 ? call.deadlineUptimeMillis - 100 : SystemClock.uptimeMillis() + 20000;
+        main.postAtTime(() -> {
+            if (stillTimeout == token) finishStill(ExtResult.error("timeout", "no photo arrived from the glasses"));
+        }, token, at);
+        cameraPhoto.capturePhoto(pr, pq);
+    }
+
+    private void finishStill(ExtResult r) {
+        ExtResult.Callback reply = stillReply;
+        stillReply = null;
+        if (stillTimeout != null) main.removeCallbacksAndMessages(stillTimeout);
+        stillTimeout = null;
+        photoBusy = false;
+        if (reply != null) reply.reply(r);
+    }
+
+    private void onStill(PhotoCaptureData d) {
+        if (stillReply == null || d == null) return;
+        ExtResult.Callback reply = stillReply;
+        stillReply = null;
+        if (stillTimeout != null) main.removeCallbacksAndMessages(stillTimeout);
+        stillTimeout = null;
+        String res = stillResolution;
+        String q = stillQuality;
+        String id = newId("p");
+        worker.execute(() -> {
+            ExtResult out;
+            try {
+                byte[] bytes = d.getImageData();
+                BitmapFactory.Options bounds = new BitmapFactory.Options();
+                bounds.inJustDecodeBounds = true;
+                BitmapFactory.decodeByteArray(bytes, 0, bytes.length, bounds);
+                boolean isJpeg = bytes.length > 2 && (bytes[0] & 0xff) == 0xFF && (bytes[1] & 0xff) == 0xD8;
+                byte[] jpeg = bytes;
+                if (!isJpeg) {
+                    Bitmap b = BitmapFactory.decodeByteArray(bytes, 0, bytes.length);
+                    jpeg = b == null ? null : GlassesMedia.jpeg(b, GlassesMedia.PHOTO_QUALITY);
+                }
+                if (jpeg == null) throw new IOException("the photo could not be encoded");
+                File file = new File(mediaDir(), id + ".jpg");
+                GlassesMedia.write(file, jpeg);
+                JSONObject m = mediaJson(id, "jpg", file);
+                m.put("width", bounds.outWidth).put("height", bounds.outHeight).put("resolution", res).put("quality", q);
+                out = ExtResult.ok(m);
+            } catch (IOException | JSONException | RuntimeException e) {
+                out = ExtResult.error("capture_failed", "the photo could not be saved");
+            }
+            ExtResult result = out;
+            main.post(() -> {
+                photoBusy = false;
+                if (result.isOk()) ctx.emit("media", result.data());
+                reply.reply(result);
+            });
+        });
+    }
+
+    private static ExtResult photoError(PhotoError e) {
+        if (e == PhotoError.PERMISSION_DENIED) return ExtResult.error("permission_denied", describe(e));
+        if (e == PhotoError.DEVICE_DISCONNECTED) return ExtResult.error("no_device", describe(e));
+        if (e == PhotoError.BUSY) return ExtResult.error("busy", describe(e));
+        if (e == PhotoError.DEVICE_HEALTH_CRITICAL) return ExtResult.error("device_limit", describe(e));
+        if (e == PhotoError.SERVICE_UNAVAILABLE || e == PhotoError.NOT_READY) return ExtResult.error("unavailable", describe(e));
+        return ExtResult.error("capture_failed", describe(e));
+    }
+
     private void recordStart(ExtCall call, ExtResult.Callback reply) throws JSONException {
         Object s = call.params.get("seconds");
         int seconds = s instanceof Number ? ((Number) s).intValue() : 10;
@@ -714,11 +1371,12 @@ public final class GlassesExtension implements NativeExtension {
             return;
         }
         // Written as .mp4.part and renamed when finished, so the server never serves half a file.
-        recorder = new GlassesMedia.ClipRecorder(new File(mediaDir(), id + ".mp4.part"), fps);
+        // With the stream's audio on, the clip carries it as AAC beside the H.264 video.
+        recorder = new GlassesMedia.ClipRecorder(new File(mediaDir(), id + ".mp4.part"), fps, audio ? audioRate : 0, audioChannels);
         recorderGen = cg;
         recorderSeconds = seconds;
         main.postAtTime(() -> stopClip(cg, "limit", null), clipTimer, SystemClock.uptimeMillis() + seconds * 1000L);
-        reply.reply(ExtResult.ok(new JSONObject().put("id", id).put("kind", "mp4").put("seconds", seconds)
+        reply.reply(ExtResult.ok(new JSONObject().put("id", id).put("kind", "mp4").put("seconds", seconds).put("audio", audio)
                 .put("url", server.base() + "/media/" + id + ".mp4")));
     }
 
@@ -871,6 +1529,7 @@ public final class GlassesExtension implements NativeExtension {
         MockDeviceKitInterface kit = MockDeviceKit.Companion.getInstance(ctx.app());
         if (!on) {
             teardown("mock_off");
+            endSession("mock_off");
             if (mockGlasses != null) kit.unpairDevice(mockGlasses);
             mockGlasses = null;
             kit.disable();
@@ -906,7 +1565,12 @@ public final class GlassesExtension implements NativeExtension {
                 }
                 // DAT 1.1.0 adds isDevMode; null leaves the simulated registration mode as it is.
                 kit.enable(new MockDeviceKitConfig(true, true, null));
-                DatResult<MockGlasses, MockDeviceKitError> g = kit.pairGlasses(GlassesModel.RAYBAN_META);
+                GlassesModel model = GlassesModel.RAYBAN_META;
+                Object asked = call.params.get("model");
+                for (GlassesModel m : GlassesModel.values()) {
+                    if (m.name().toLowerCase(Locale.ROOT).equals(asked)) model = m;
+                }
+                DatResult<MockGlasses, MockDeviceKitError> g = kit.pairGlasses(model);
                 if (!g.isSuccess()) {
                     kit.disable();
                     reply.reply(ExtResult.error("mock_failed", describe(g.errorOrNull())));
@@ -918,6 +1582,7 @@ public final class GlassesExtension implements NativeExtension {
                 mockGlasses.don();
                 mockGlasses.getServices().getCamera().setCameraFeed(Uri.fromFile(feed));
                 mockGlasses.getServices().getCamera().setCapturedImage(Uri.fromFile(photo));
+                mockGlasses.getServices().getCameraCapture().setCapturedPhoto(Uri.fromFile(photo));
                 mock = true;
                 try {
                     reply.reply(ExtResult.ok(status().put("mockFeedCodec", c)));
@@ -928,7 +1593,93 @@ public final class GlassesExtension implements NativeExtension {
         });
     }
 
+    /**
+     * Drives the Mock Device Kit's simulated glasses (debug builds, after mock enabled true), so a
+     * page can exercise every event without real glasses.
+     */
+    private void mockEvent(ExtCall call, ExtResult.Callback reply) throws JSONException {
+        if ((ctx.app().getApplicationInfo().flags & ApplicationInfo.FLAG_DEBUGGABLE) == 0) {
+            reply.reply(ExtResult.error("mock_unavailable", "the mock glasses run in debug builds only"));
+            return;
+        }
+        MockGlasses g = mockGlasses;
+        if (g == null) {
+            reply.reply(ExtResult.error("not_active", "turn the mock glasses on first (mock enabled true)"));
+            return;
+        }
+        String ev = str(call, "event") == null ? "" : str(call, "event");
+        Object v = call.params.get("value");
+        int value = v instanceof Number ? ((Number) v).intValue() : 0;
+        String text = str(call, "text") == null ? "" : str(call, "text");
+        InputSource source = GlassesCapabilities.Sensors.SOURCES.containsKey(text) ? GlassesCapabilities.Sensors.SOURCES.get(text) : InputSource.CAPTOUCH;
+        JSONObject out = new JSONObject().put("event", ev);
+        switch (ev) {
+            case "power_on": g.powerOn(); break;
+            case "power_off": g.powerOff(); break;
+            case "don": g.don(); break;
+            case "doff": g.doff(); break;
+            case "fold": g.fold(); break;
+            case "unfold": g.unfold(); break;
+            case "battery": g.setBatteryLevel(value); break;
+            case "charging": g.setChargingState(value != 0 ? ChargingState.CHARGING : ChargingState.NOT_CHARGING); break;
+            case "thermal": {
+                ThermalLevel[] levels = {ThermalLevel.NONE, ThermalLevel.LIGHT, ThermalLevel.MODERATE, ThermalLevel.SEVERE,
+                        ThermalLevel.CRITICAL, ThermalLevel.EMERGENCY, ThermalLevel.SHUTDOWN};
+                g.setThermalLevel(levels[Math.max(0, Math.min(levels.length - 1, value))]);
+                break;
+            }
+            case "tap": g.getServices().getCaptouch().tap(); break;
+            case "tap_and_hold": g.getServices().getCaptouch().tapAndHold(); break;
+            case "nav_up": g.getServices().getInput().navUp(source); break;
+            case "nav_down": g.getServices().getInput().navDown(source); break;
+            case "nav_left": g.getServices().getInput().navLeft(source); break;
+            case "nav_right": g.getServices().getInput().navRight(source); break;
+            case "select": g.getServices().getInput().select(source); break;
+            case "back": g.getServices().getInput().back(source); break;
+            case "capture":
+                g.getServices().getInput().capture(text.equals("hold") ? CapturePressType.HOLD
+                        : text.equals("double") ? CapturePressType.DOUBLE_PRESS : CapturePressType.SHORT_PRESS);
+                break;
+            case "action_button": g.getServices().getInput().button(ButtonType.ACTION); break;
+            case "drag": g.getServices().getInput().drag(DragAction.MOVE, 0f, 0f, value, 0f); break;
+            case "transcription": g.getServices().getSpeech().simulateTranscription(text, value != 0, 0.9f); break;
+            case "speech_locale": g.getServices().getSpeech().setLocale(text); break;
+            case "voice_launch": {
+                String a = g.getServices().getVoiceInvocation().simulateLaunchAppAction();
+                out.put("action", a == null ? JSONObject.NULL : a);
+                break;
+            }
+            case "photo_failure": g.getServices().getCameraCapture().simulateCaptureFailure(); break;
+            case "app_update_required": g.getServices().setDATAppUpdateRequirementEnabled(value != 0); break;
+            case "firmware_update_required": g.getServices().setFirmwareUpdateRequirementEnabled(value != 0); break;
+            case "camera_permission":
+            case "microphone_permission":
+                MockDeviceKit.Companion.getInstance(ctx.app()).getPermissions().set(
+                        ev.equals("camera_permission") ? Permission.CAMERA : Permission.MICROPHONE,
+                        value != 0 ? PermissionStatus.Granted.INSTANCE : PermissionStatus.Denied.INSTANCE);
+                break;
+            case "display_click": out.put("delivered", g.getServices().getDisplay().sendClick(text)); break;
+            default:
+                reply.reply(ExtResult.error("bad_request", "unknown mock event"));
+                return;
+        }
+        reply.reply(ExtResult.ok(out));
+    }
+
     // -------------------------------------------------------------------------------- helpers
+
+    private static String str(ExtCall call, String key) {
+        Object v = call.params.get(key);
+        return v instanceof String ? (String) v : null;
+    }
+
+    private void replyStatus(ExtResult.Callback reply) {
+        try {
+            reply.reply(ExtResult.ok(status()));
+        } catch (JSONException e) {
+            reply.reply(ExtResult.error("handler_error", "could not build the reply"));
+        }
+    }
 
     private String newId(String prefix) {
         return prefix + Long.toString(System.currentTimeMillis(), 36) + String.format(Locale.ROOT, "%04x", random.nextInt(0x10000));
@@ -945,13 +1696,7 @@ public final class GlassesExtension implements NativeExtension {
     }
 
     private static ExtResult sessionError(DeviceSessionError e) {
-        if (e == DeviceSessionError.NO_ELIGIBLE_DEVICE || e == DeviceSessionError.DEVICE_DISCONNECTED) {
-            return ExtResult.error("no_device", describe(e));
-        }
-        if (e == DeviceSessionError.CAPABILITY_DENIED) return ExtResult.error("permission_denied", describe(e));
-        if (e == DeviceSessionError.SESSION_ALREADY_EXISTS) return ExtResult.error("busy", describe(e));
-        if (e == DeviceSessionError.NOT_REGISTERED) return ExtResult.error("registration_required", describe(e));
-        return ExtResult.error("session_failed", describe(e));
+        return GlassesCapabilities.session(e);
     }
 
     /** The registration error codes, the same words iOS returns from register. */

@@ -90,7 +90,7 @@ class IosRequestLifetime(unittest.TestCase):
         main = cls.work / "main.swift"
         main.write_bytes((SUPPORT / "server_main.swift").read_bytes())
         cls.exe = cls.work / "server"
-        compiled = run(["swiftc", "-D", "NATIVE_EXT_ENABLED", "-module-cache-path", cls.work / "module-cache",
+        compiled = run(["swiftc", "-D", "DESPIA_NX_ENABLED", "-module-cache-path", cls.work / "module-cache",
                         IOS / "GlassesCore.swift", IOS / "GlassesServer.swift", main, "-o", cls.exe])
         if compiled.returncode:
             raise AssertionError("Network.framework compile failed:\n" + compiled.stdout + compiled.stderr)

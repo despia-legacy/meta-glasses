@@ -7,7 +7,11 @@ import MWDATCore
 import MWDATMockDevice
 import UIKit
 
-/// Meta Ray-Ban glasses camera through Meta's Wearables Device Access Toolkit (DAT) 1.1.0.
+/// Meta glasses through Meta's Wearables Device Access Toolkit (DAT) 1.1.0: registration with the
+/// Meta AI app (and Meta AI-initiated registration requests), camera and microphone permissions,
+/// devices and their state, the device session (start, pause, resume, stop), the camera stream with
+/// optional audio, in-stream and high-quality photos, clips, speech, motion, inputs, voice
+/// invocations, the glasses display, Bluetooth audio routing, update prompts and the Mock Device Kit.
 ///
 /// The page starts and stops the glasses' camera stream and shows it from a loopback URL
 /// (`GlassesServer`): `<img src=live>` is a multipart JPEG stream that always carries the newest
@@ -34,7 +38,7 @@ final class GlassesExtension: NativeExtension {
         guard #available(iOS 17.2, *) else {
             return .error(code: "platform_limit", message: "Meta's glasses SDK needs iOS 17.2 or later")
         }
-        if call.route == "mock", !GlassesController.mockAllowed {
+        if call.route == "mock" || call.route == "mock_event", !GlassesController.mockAllowed {
             return .error(code: "mock_unavailable", message: "the mock glasses run in debug builds only")
         }
         guard let c = controller() else { return .error(code: "init_failed", message: "the extension has no context") }
@@ -96,6 +100,23 @@ final class GlassesController {
     private var mock = false
     private var mockGlasses: (any MockGlasses)?
 
+    private var sessionTokens: ListenerTokenBag?
+    private var sessionStarting = false
+    private var sessionError: NativeExtResult?
+    private var lastSessionState = "idle"
+    private var registrationRequest: RegistrationRequest?
+    private var devices: GlassesDevices?
+    private lazy var sensors = GlassesSensors { [weak self] e, d in self?.context.emit(e, d) }
+    private lazy var display = GlassesDisplay { [weak self] e, d in self?.context.emit(e, d) }
+    private var audio = false
+    private var audioRate = 16000
+    private var audioChannels = 1
+    private var cameraPhoto: Photo?
+    private var stillData: PhotoCaptureData?
+    private var stillError: PhotoError?
+    private var savedAudio: (AVAudioSession.Category, AVAudioSession.Mode, AVAudioSession.CategoryOptions)?
+    private var audioRouteObserver: NSObjectProtocol?
+
     init(context: NativeExtContext) {
         self.context = context
         mediaDirectory = context.dataDirectory.appendingPathComponent("media", isDirectory: true)
@@ -108,15 +129,25 @@ final class GlassesController {
         URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.contains { $0.name == "metaWearablesAction" } == true
     }
 
+    /// The Meta AI app's return URL. A registration Meta AI started (the person chose this app in
+    /// Meta AI) arrives as a RegistrationRequest: the page decides with registration_continue or
+    /// registration_cancel after the registration_request event.
     func handleURL(_ url: URL) {
         guard configure() else { return }
         Task { @MainActor in
             do {
-                _ = try await Wearables.shared.handleUrl(url)
+                _ = try await Wearables.shared.handleUrl(url) { [weak self] request in
+                    DispatchQueue.main.async { MainActor.assumeIsolated { self?.registrationRequested(request) } }
+                }
             } catch {
                 context.log("handleUrl failed: \(error.localizedDescription)")
             }
         }
+    }
+
+    private func registrationRequested(_ request: RegistrationRequest) {
+        registrationRequest = request
+        context.emit("registration_request", ["flowId": request.flowID, "protocolVersion": request.protocolVersion])
     }
 
     func route(_ call: NativeExtCall) async -> NativeExtResult {
@@ -140,6 +171,30 @@ final class GlassesController {
         case "media_read": return mediaRead(call)
         case "media_delete": return mediaDelete(call)
         case "mock": return await mockRoute(call)
+        case "mock_event": return mockEvent(call)
+        case "devices": return .ok(["devices": devices?.list() ?? []])
+        case "session_start": return await sessionStart(call)
+        case "session_stop":
+            endSession("stopped")
+            return .ok(status())
+        case "pause", "resume": return pauseResume(call.route == "pause")
+        case "registration_continue", "registration_cancel": return await registrationAnswer(call)
+        case "open_update": return await openUpdate(call)
+        case "audio_route": return audioRoute(call)
+        case "speech_start", "motion_start", "inputs_start", "display_start": return await capabilityStart(call)
+        case "speech_stop": return sensors.speechStop(session)
+        case "motion_stop": return sensors.motionStop(session)
+        case "inputs_stop": return sensors.inputsStop(session)
+        case "display_stop": return display.stop(session)
+        case "display_send": return await display.send(call.params["content"] as? String ?? "")
+        case "display_video": return await display.video(call.params["url"] as? String ?? "")
+        case "display_video_stop": return await display.videoStop()
+        case "display_clear": return await display.clear()
+        case "voice_start": return voiceStart(call)
+        case "voice_stop": return sensors.voiceStop()
+        case "voice_respond":
+            return await sensors.voiceRespond(id: call.params["id"] as? String ?? "", success: call.params["success"] as? Bool ?? true,
+                                              output: call.params["output"] as? String)
         default: return .error(code: "bad_request", message: "unknown route")
         }
     }
@@ -163,6 +218,9 @@ final class GlassesController {
                 MainActor.assumeIsolated { self?.context.emit("registration", ["registration": Self.name(s)]) }
             }
         }.store(in: appTokens)
+        let d = GlassesDevices { [weak self] e, o in self?.context.emit(e, o) }
+        devices = d
+        d.start()
         return true
     }
 
@@ -198,6 +256,10 @@ final class GlassesController {
             "width": seen.width > 0 ? seen.width : size.0, "height": seen.height > 0 ? seen.height : size.1,
             "frames": seen.frames, "staleDrops": core.staleDrops,
             "clip": core.clip ?? NSNull(), "photoBusy": photoBusy, "mock": mock,
+            "session": session.map { GlassesJSON.session($0.state) } ?? "none",
+            "device": session?.deviceId ?? NSNull(), "audio": audio, "audioRate": audioRate, "audioChannels": audioChannels,
+            "speech": sensors.speech != nil, "motion": sensors.motion != nil, "inputs": sensors.inputs != nil,
+            "display": display.active, "voice": sensors.voiceState,
         ]
         if let server {
             o["live"] = server.base + "/live.mjpg"
@@ -236,20 +298,28 @@ final class GlassesController {
         return .ok(["registration": Self.name(Wearables.shared.registrationState)])
     }
 
+    /// Bluetooth, and the glasses' camera and microphone permissions (DAT's Permission.camera and
+    /// .microphone, granted in the Meta AI app). `kind` picks the one a prompt asks for; both are
+    /// reported.
     private func permission(_ call: NativeExtCall) async -> NativeExtResult {
         let prompt = call.params["prompt"] as? Bool ?? false
+        let asked: Permission = call.params["kind"] as? String == "microphone" ? .microphone : .camera
         guard Wearables.shared.registrationState == .registered else {
-            // The camera permission belongs to a registered app; Meta AI cannot answer it before.
-            return .ok(["bluetooth": Self.bluetooth(), "camera": "unknown"])
+            // The glasses permissions belong to a registered app; Meta AI cannot answer them before.
+            return .ok(["bluetooth": Self.bluetooth(), "camera": "unknown", "microphone": "unknown"])
         }
         do {
-            var status = try await Wearables.shared.checkPermissionStatus(.camera)
+            var status = try await Wearables.shared.checkPermissionStatus(asked)
             if status != .granted && prompt {
                 guard call.isActive else { return .error(code: "timeout", message: "the permission check took too long") }
                 // Switches to the Meta AI app; returns once the person answered there.
-                status = try await Wearables.shared.requestPermission(.camera)
+                status = try await Wearables.shared.requestPermission(asked)
             }
-            return .ok(["bluetooth": Self.bluetooth(), "camera": status == .granted ? "granted" : "denied"])
+            let other: Permission = asked == .camera ? .microphone : .camera
+            let otherStatus = (try? await Wearables.shared.checkPermissionStatus(other)).map { $0 == .granted ? "granted" : "denied" } ?? "unknown"
+            let word = status == .granted ? "granted" : "denied"
+            return .ok(["bluetooth": Self.bluetooth(), "camera": asked == .camera ? word : otherStatus,
+                        "microphone": asked == .microphone ? word : otherStatus])
         } catch {
             // DAT declares throws(PermissionError), so this is the only error kind.
             switch error {
@@ -271,6 +341,9 @@ final class GlassesController {
         guard core.state == "idle" else { return .error(code: "busy", message: "the stream is already \(core.state)") }
         let wantQuality = call.params["quality"] as? String ?? "medium"
         let wantFps = GlassesCore.frameRate(call.params["fps"] as? Int ?? 24)
+        let wantAudio = call.params["audio"] as? Bool ?? false
+        let wantRate = Int(call.params["audio_rate"] as? String ?? "16000") ?? 16000
+        let wantChannels = min(2, max(1, call.params["audio_channels"] as? Int ?? 1))
         if server == nil {
             do {
                 try FileManager.default.createDirectory(at: mediaDirectory, withIntermediateDirectories: true)
@@ -279,45 +352,34 @@ final class GlassesController {
                 return .error(code: "server_failed", message: "the local stream server could not start")
             }
         }
-        let s: DeviceSession
-        do {
-            s = try Wearables.shared.createSession(deviceSelector: AutoDeviceSelector(wearables: Wearables.shared))
-        } catch {
-            return Self.sessionError(error)
-        }
         let g = core.begin()
         quality = wantQuality
         fps = wantFps
-        session = s
+        audio = wantAudio
+        audioRate = wantRate
+        audioChannels = wantChannels
         startError = nil
         streamSeenActive = false
-        let bag = ListenerTokenBag()
-        streamTokens = bag
-        s.errorPublisher.listen { [weak self] e in
-            DispatchQueue.main.async { MainActor.assumeIsolated { self?.failStartOrEnd(g, Self.sessionError(e), "session_error") } }
-        }.store(in: bag)
-        s.statePublisher.listen { [weak self] st in
-            DispatchQueue.main.async { MainActor.assumeIsolated { self?.onSessionState(g, st) } }
-        }.store(in: bag)
         emitState("starting")
-        do {
-            try s.start()
-        } catch {
-            teardown("start_failed")
-            return Self.sessionError(error)
+        if let e = await openSession(call, device: call.params["device"] as? String) {
+            if core.gen == g { teardown("start_failed") }
+            return e
         }
-        // A capability can be added only once the session reports started (Meta, "Camera Streaming").
-        let started = await waitUntil(call) { [weak self] in self?.session?.state == .started || self?.core.gen != g }
         if let e = startFailure(g) { return e }
-        guard started, call.isActive else {
-            teardown("start_failed")
+        guard let s = session, call.isActive else {
+            if core.gen == g { teardown("start_failed") }
             return .error(code: "timeout", message: "the glasses did not connect in time")
         }
+        let bag = ListenerTokenBag()
+        streamTokens = bag
         let resolution: StreamingResolution = wantQuality == "high" ? .high : wantQuality == "low" ? .low : .medium
+        // Camera audio (DAT 1.0.0, experimental): PCM at 16, 44.1 or 48 kHz beside the video, into clips.
+        let rate: AudioSampleRate = wantRate == 48000 ? .rate48000 : wantRate == 44100 ? .rate44100 : .rate16000
+        let audioCodec: MWDATCamera.AudioCodec? = wantAudio ? .pcm(sampleRate: rate, numberOfChannels: UInt32(wantChannels)) : nil
         let cam: Camera?
         do {
             // Decoded frames (.raw): the preview needs no decoder of its own.
-            cam = try s.addCamera(config: StreamConfiguration(videoCodec: .raw, resolution: resolution, frameRate: UInt(wantFps)))
+            cam = try s.addCamera(config: StreamConfiguration(videoCodec: .raw, audioCodec: audioCodec, resolution: resolution, frameRate: UInt(wantFps)))
         } catch {
             teardown("start_failed")
             return Self.sessionError(error)
@@ -341,6 +403,9 @@ final class GlassesController {
             DispatchQueue.main.async { MainActor.assumeIsolated { self?.onPhoto(g, p) } }
         }.store(in: bag)
         st.videoFramePublisher.listen { [pipe] f in pipe.push(f, gen: g) }.store(in: bag)
+        if wantAudio {
+            st.audioFramePublisher.listen { [pipe] a in pipe.pushAudio(a, gen: g) }.store(in: bag)
+        }
         st.start()
         let streaming = await waitUntil(call) { [weak self] in self?.core.state == "streaming" || self?.core.gen != g }
         if let e = startFailure(g) { return e }
@@ -349,6 +414,244 @@ final class GlassesController {
             return .error(code: "timeout", message: "the glasses did not start streaming in time")
         }
         return .ok(status())
+    }
+
+    // MARK: - Device session
+
+    /// The one DeviceSession every capability shares (camera, speech, motion, inputs, display). nil
+    /// when it is started; otherwise the error to answer. `device` picks a device by id
+    /// (SpecificDeviceSelector); without it DAT's AutoDeviceSelector picks one.
+    private func openSession(_ call: NativeExtCall, device: String?) async -> NativeExtResult? {
+        guard Wearables.shared.registrationState == .registered else {
+            return .error(code: "registration_required", message: "connect the app to Meta AI first (register)")
+        }
+        if let s = session {
+            if let device, device != s.deviceId {
+                return .error(code: "busy", message: "a session with another device is open (session_stop first)")
+            }
+            if s.state == .started || s.state == .paused { return nil }
+            let ok = await waitUntil(call) { [weak self] in self?.session !== s || s.state == .started }
+            if session === s, ok { return nil }
+            return sessionError ?? .error(code: "no_device", message: "the glasses session stopped before it started")
+        }
+        let s: DeviceSession
+        do {
+            let selector: any DeviceSelector = device.map { SpecificDeviceSelector(device: $0) } ?? AutoDeviceSelector(wearables: Wearables.shared)
+            s = try Wearables.shared.createSession(deviceSelector: selector)
+        } catch {
+            return Self.sessionError(error)
+        }
+        session = s
+        sessionError = nil
+        let bag = ListenerTokenBag()
+        sessionTokens = bag
+        s.errorPublisher.listen { [weak self, weak s] e in
+            DispatchQueue.main.async { MainActor.assumeIsolated { if let s { self?.onSessionError(s, e) } } }
+        }.store(in: bag)
+        s.statePublisher.listen { [weak self, weak s] st in
+            DispatchQueue.main.async { MainActor.assumeIsolated { if let s { self?.onSessionState(s, st) } } }
+        }.store(in: bag)
+        do {
+            try s.start()
+        } catch {
+            endSession("start_failed")
+            return Self.sessionError(error)
+        }
+        // A capability can be added only once the session reports started (Meta, "Camera Streaming").
+        let started = await waitUntil(call) { [weak self] in self?.session !== s || s.state == .started }
+        guard session === s else {
+            return sessionError ?? .error(code: "no_device", message: "the glasses session stopped before it started")
+        }
+        guard started, call.isActive else {
+            endSession("start_failed")
+            return .error(code: "timeout", message: "the glasses did not connect in time")
+        }
+        return nil
+    }
+
+    private func sessionStart(_ call: NativeExtCall) async -> NativeExtResult {
+        if let e = await openSession(call, device: call.params["device"] as? String) { return e }
+        return .ok(status())
+    }
+
+    private func onSessionState(_ s: DeviceSession, _ st: DeviceSessionState) {
+        guard session === s else { return }
+        lastSessionState = GlassesJSON.session(st)
+        context.emit("session", ["state": lastSessionState, "device": s.deviceId])
+        guard st == .stopped else { return }
+        // The SDK ended the session: cleared first, so the camera's end releases nothing again.
+        session = nil
+        let g = core.gen
+        if core.state != "idle" {
+            if streamSeenActive {
+                ended(g, "session_stopped")
+            } else if core.state == "starting" {
+                failStartOrEnd(g, sessionError ?? .error(code: "no_device", message: "the glasses session stopped before streaming"), "start_failed")
+            }
+        }
+        sensors.sessionEnded()
+        display.sessionEnded()
+        sessionTokens?.clear()
+        sessionTokens = nil
+    }
+
+    private func onSessionError(_ s: DeviceSession, _ e: DeviceSessionError) {
+        guard session === s else { return }
+        let code = GlassesErrors.sessionCode(e)
+        context.emit("session", ["state": GlassesJSON.session(s.state), "device": s.deviceId, "error": code, "message": e.description])
+        // DAT 1.0.0: an app built with an SDK outside the glasses' supported range keeps working;
+        // the warning only suggests an update.
+        if e == .dwaOutOfStuRange { return }
+        let r = Self.sessionError(e)
+        sessionError = r
+        if core.state != "idle" { failStartOrEnd(core.gen, r, "session_error") }
+    }
+
+    /// Ends the session and every capability on it.
+    private func endSession(_ reason: String) {
+        // Cleared first: the camera's teardown below then finds no session to release again.
+        let s = session
+        session = nil
+        sessionTokens?.clear()
+        sessionTokens = nil
+        teardown(reason)
+        sensors.sessionEnded()
+        display.sessionEnded()
+        guard let s else { return }
+        s.stop()
+        lastSessionState = "stopped"
+        context.emit("session", ["state": "stopped", "device": s.deviceId, "reason": reason])
+    }
+
+    /// The camera, speech, motion, inputs and display are all off: the session has no work left.
+    private func releaseSessionIfIdle() {
+        guard session != nil, camera == nil, !sensors.active, !display.active else { return }
+        endSession("idle")
+    }
+
+    private func pauseResume(_ pause: Bool) -> NativeExtResult {
+        guard let s = session else { return .error(code: "not_active", message: "no glasses session is open") }
+        // DAT 1.1.0: pause() outside started and resume() outside paused do nothing.
+        if pause { s.pause() } else { s.resume() }
+        return .ok(["session": GlassesJSON.session(s.state), "device": s.deviceId])
+    }
+
+    private func capabilityStart(_ call: NativeExtCall) async -> NativeExtResult {
+        if let e = await openSession(call, device: call.params["device"] as? String) { return e }
+        guard let s = session else { return .error(code: "no_device", message: "the glasses session ended") }
+        let r: NativeExtResult
+        switch call.route {
+        case "speech_start": r = sensors.speechStart(s)
+        case "motion_start": r = sensors.motionStart(s, rate: Int(call.params["rate"] as? String ?? "10") ?? 10)
+        case "inputs_start": r = sensors.inputsStart(s, sources: call.params["sources"] as? String, consumeBack: call.params["consume_back"] as? Bool ?? true)
+        default: r = display.start(s)
+        }
+        if case .error = r { releaseSessionIfIdle() }
+        return r
+    }
+
+    private func voiceStart(_ call: NativeExtCall) -> NativeExtResult {
+        guard Wearables.shared.registrationState == .registered else {
+            return .error(code: "registration_required", message: "connect the app to Meta AI first (register)")
+        }
+        guard let device = call.params["device"] as? String ?? session?.deviceId ?? Wearables.shared.devices.first else {
+            return .error(code: "no_device", message: "no glasses are connected")
+        }
+        return sensors.voiceStart(device: device)
+    }
+
+    // MARK: - Registration requests and update prompts
+
+    private func registrationAnswer(_ call: NativeExtCall) async -> NativeExtResult {
+        guard let r = registrationRequest else { return .error(code: "not_found", message: "no registration request from Meta AI is open") }
+        registrationRequest = nil
+        do {
+            if call.route == "registration_continue" {
+                try await r.continueRegistration()
+            } else {
+                // DAT 1.1.0: true returns to Meta AI (the person declined); false declines here
+                // (a setup failure the app shows itself).
+                try await r.cancelRegistration(returnToMetaAI: call.params["return_to_meta_ai"] as? Bool ?? true)
+            }
+        } catch {
+            switch error {
+            case .metaAINotInstalled: return .error(code: "meta_ai_missing", message: error.description)
+            case .alreadyHandled, .invalidRequest: return .error(code: "not_found", message: error.description)
+            case .networkUnavailable: return .error(code: "unavailable", message: error.description)
+            default: return .error(code: "registration_failed", message: error.description)
+            }
+        }
+        return .ok(["flowId": r.flowID, "answer": call.route == "registration_continue" ? "continue" : "cancel"])
+    }
+
+    private func openUpdate(_ call: NativeExtCall) async -> NativeExtResult {
+        let target = call.params["target"] as? String ?? "firmware"
+        do {
+            if target == "glasses_app" {
+                try await Wearables.shared.openDATGlassesAppUpdate()
+            } else {
+                try await Wearables.shared.openFirmwareUpdate()
+            }
+        } catch {
+            switch error {
+            case .metaAINotInstalled: return .error(code: "meta_ai_missing", message: error.description)
+            case .notRegistered: return .error(code: "registration_required", message: error.description)
+            @unknown default: return .error(code: "unavailable", message: error.description)
+            }
+        }
+        return .ok(["opened": target])
+    }
+
+    // MARK: - Bluetooth audio
+
+    /// Routes the app's audio to the glasses over Bluetooth: `call` uses Hands-Free (the glasses'
+    /// microphones and speakers, for getUserMedia and calls), `media` uses A2DP playback (the
+    /// glasses' speakers, phone microphone), `default` puts back the category the app had before.
+    /// DAT itself carries no phone audio; Meta's glasses are standard Bluetooth audio devices.
+    private func audioRoute(_ call: NativeExtCall) -> NativeExtResult {
+        let mode = call.params["mode"] as? String ?? "call"
+        let a = AVAudioSession.sharedInstance()
+        do {
+            switch mode {
+            case "default":
+                if let (c, m, o) = savedAudio { try a.setCategory(c, mode: m, options: o) }
+                savedAudio = nil
+                try? a.setPreferredInput(nil)
+                if let o = audioRouteObserver { NotificationCenter.default.removeObserver(o) }
+                audioRouteObserver = nil
+            default:
+                if savedAudio == nil { savedAudio = (a.category, a.mode, a.categoryOptions) }
+                if mode == "media" {
+                    try a.setCategory(.playback, mode: .default, options: [])
+                } else {
+                    try a.setCategory(.playAndRecord, mode: .voiceChat, options: [.allowBluetoothHFP, .allowBluetoothA2DP])
+                }
+                try a.setActive(true)
+                if mode == "call", let hfp = a.availableInputs?.first(where: { $0.portType == .bluetoothHFP }) {
+                    try a.setPreferredInput(hfp)
+                }
+                if audioRouteObserver == nil {
+                    audioRouteObserver = NotificationCenter.default.addObserver(forName: AVAudioSession.routeChangeNotification, object: nil, queue: .main) { [weak self] _ in
+                        MainActor.assumeIsolated { self?.context.emit("audio", Self.audioState()) }
+                    }
+                }
+            }
+        } catch {
+            return .error(code: "audio_failed", message: error.localizedDescription)
+        }
+        var o = Self.audioState()
+        o["mode"] = mode
+        return .ok(o)
+    }
+
+    static func audioState() -> [String: Any] {
+        let r = AVAudioSession.sharedInstance().currentRoute
+        let port: (AVAudioSessionPortDescription) -> [String: Any] = { p in
+            ["name": p.portName, "type": p.portType.rawValue,
+             "bluetooth": [.bluetoothHFP, .bluetoothA2DP, .bluetoothLE].contains(p.portType)]
+        }
+        return ["inputs": r.inputs.map(port), "outputs": r.outputs.map(port),
+                "glasses": r.outputs.contains { [.bluetoothHFP, .bluetoothA2DP, .bluetoothLE].contains($0.portType) }]
     }
 
     private func startFailure(_ g: Int64) -> NativeExtResult? {
@@ -362,14 +665,6 @@ final class GlassesController {
             if cond() { return true }
             if !call.isActive || DispatchTime.now() + .milliseconds(100) >= call.deadline { return false }
             try? await Task.sleep(nanoseconds: 50_000_000)
-        }
-    }
-
-    private func onSessionState(_ g: Int64, _ st: DeviceSessionState) {
-        guard g == core.gen else { return }
-        if st == .stopped && streamSeenActive { ended(g, "session_stopped") }
-        if st == .stopped && !streamSeenActive && core.state == "starting" {
-            failStartOrEnd(g, .error(code: "no_device", message: "the glasses session stopped before streaming"), "start_failed")
         }
     }
 
@@ -428,17 +723,18 @@ final class GlassesController {
         if wasActive { emitState(reason) }
     }
 
+    /// Ends the camera (its stream and photo). The session stays while another capability uses it.
     private func stopSDK() {
         pipe.end()
         streamTokens?.clear()
         streamTokens = nil
-        // camera.stop cascades to its stream; DeviceSession.stop to every capability.
+        // camera.stop cascades to its stream and photo.
         camera?.stop()
-        session?.stop()
         camera = nil
         stream = nil
-        session = nil
+        cameraPhoto = nil
         server?.endLive()
+        releaseSessionIfIdle()
     }
 
     // MARK: - Photo and clips
@@ -449,6 +745,7 @@ final class GlassesController {
     }
 
     private func photo(_ call: NativeExtCall) async -> NativeExtResult {
+        if call.params["resolution"] != nil || call.params["quality"] != nil { return await stillPhoto(call) }
         guard core.state == "streaming", let stream else { return .error(code: "not_streaming", message: "start the stream first") }
         guard !photoBusy else { return .error(code: "busy", message: "a photo is already being taken") }
         photoBusy = true
@@ -483,6 +780,81 @@ final class GlassesController {
         return .ok(m)
     }
 
+    /// A high-quality still through DAT's Camera.photo (DAT 1.0.0, experimental): the glasses take
+    /// the picture at `resolution` and `quality` and transfer it, reporting `photo_progress`.
+    private func stillPhoto(_ call: NativeExtCall) async -> NativeExtResult {
+        guard core.state == "streaming" || core.state == "paused", let camera else {
+            return .error(code: "not_streaming", message: "start the stream first")
+        }
+        guard !photoBusy else { return .error(code: "busy", message: "a photo is already being taken") }
+        let resWord = call.params["resolution"] as? String ?? "medium"
+        let qWord = call.params["quality"] as? String ?? "medium"
+        let res: PhotoResolution = ["small": .small, "large": .large, "full": .full][resWord] ?? .medium
+        let q: PhotoQuality = ["low": .low, "high": .high][qWord] ?? .medium
+        photoBusy = true
+        stillData = nil
+        stillError = nil
+        defer {
+            photoBusy = false
+            stillData = nil
+        }
+        let gen = core.gen
+        if cameraPhoto == nil, let bag = streamTokens {
+            let p = camera.photo
+            p.photoDataPublisher.listen { [weak self] d in
+                DispatchQueue.main.async { MainActor.assumeIsolated { if self?.core.gen == gen { self?.stillData = d } } }
+            }.store(in: bag)
+            p.errorPublisher.listen { [weak self] e in
+                DispatchQueue.main.async { MainActor.assumeIsolated { if self?.core.gen == gen { self?.stillError = e } } }
+            }.store(in: bag)
+            p.transferProgressPublisher.listen { [weak self] t in
+                DispatchQueue.main.async {
+                    MainActor.assumeIsolated {
+                        self?.context.emit("photo_progress", ["received": t.bytesReceived, "total": t.totalBytes, "fraction": t.fraction])
+                    }
+                }
+            }.store(in: bag)
+            p.start()
+            cameraPhoto = p
+        }
+        guard let p = cameraPhoto else { return .error(code: "capture_failed", message: "the camera has no photo capability") }
+        p.capturePhoto(resolution: res, quality: q)
+        let got = await waitUntil(call) { [weak self] in self?.stillData != nil || self?.stillError != nil || self?.core.gen != gen }
+        if let e = stillError { return Self.photoError(e) }
+        guard got, let d = stillData else { return .error(code: "timeout", message: "no photo arrived from the glasses") }
+        let image = UIImage(data: d.imageData)
+        let isJPEG = d.imageData.count > 2 && d.imageData[0] == 0xFF && d.imageData[1] == 0xD8
+        guard let jpeg = isJPEG ? d.imageData : image?.jpegData(compressionQuality: GlassesMedia.photoQuality) else {
+            return .error(code: "capture_failed", message: "the photo could not be encoded")
+        }
+        let id = Self.newId("p")
+        let url = mediaDirectory.appendingPathComponent("\(id).jpg")
+        do {
+            try FileManager.default.createDirectory(at: mediaDirectory, withIntermediateDirectories: true)
+            try GlassesMedia.write(jpeg, to: url)
+        } catch {
+            return .error(code: "capture_failed", message: "the photo could not be saved")
+        }
+        var m = mediaJSON(id, "jpg", url)
+        m["width"] = Int(image?.size.width ?? 0) * Int(image?.scale ?? 1)
+        m["height"] = Int(image?.size.height ?? 0) * Int(image?.scale ?? 1)
+        m["resolution"] = resWord
+        m["quality"] = qWord
+        context.emit("media", m)
+        return .ok(m)
+    }
+
+    nonisolated private static func photoError(_ e: PhotoError) -> NativeExtResult {
+        switch e {
+        case .permissionDenied: return .error(code: "permission_denied", message: e.description)
+        case .deviceDisconnected: return .error(code: "no_device", message: e.description)
+        case .busy: return .error(code: "busy", message: e.description)
+        case .deviceHealthCritical: return .error(code: "device_limit", message: e.description)
+        case .serviceUnavailable, .notReady: return .error(code: "unavailable", message: e.description)
+        default: return .error(code: "capture_failed", message: e.description)
+        }
+    }
+
     private func recordStart(_ call: NativeExtCall) -> NativeExtResult {
         let seconds = call.params["seconds"] as? Int ?? 10
         let id = Self.newId("c")
@@ -495,14 +867,15 @@ final class GlassesController {
         // Written as .mp4.part and moved when finished, so the server never serves half a file.
         let part = mediaDirectory.appendingPathComponent("\(id).mp4.part")
         try? FileManager.default.removeItem(at: part)
-        pipe.setClip(GlassesClipWriter(url: part, fps: fps))
+        // With the stream's audio on, the clip carries it as AAC beside the H.264 video.
+        pipe.setClip(GlassesClipWriter(url: part, fps: fps, audioRate: audio ? audioRate : nil, audioChannels: audioChannels))
         clipTimer?.cancel()
         clipTimer = Task { [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(seconds) * 1_000_000_000)
             guard !Task.isCancelled else { return }
             _ = await self?.stopClip(cg, reason: "limit")
         }
-        return .ok(["id": id, "kind": "mp4", "seconds": seconds, "url": server.base + "/media/\(id).mp4"])
+        return .ok(["id": id, "kind": "mp4", "seconds": seconds, "audio": audio, "url": server.base + "/media/\(id).mp4"])
     }
 
     /// The frame queue saw the clip end on its own (size change, writer failure).
@@ -616,6 +989,7 @@ final class GlassesController {
         let kit = MockDeviceKit.shared
         if !on {
             teardown("mock_off")
+            endSession("mock_off")
             if let g = mockGlasses { await kit.unpairDevice(g) }
             mockGlasses = nil
             await kit.disable()
@@ -641,12 +1015,17 @@ final class GlassesController {
         guard call.isActive else { return .error(code: "timeout", message: "the mock media took too long") }
         kit.enable(config: MockDeviceKitConfig(initiallyRegistered: true, initialPermissionsGranted: true))
         do {
-            let g = try kit.pairGlasses(model: .rayBanMeta)
+            let models: [String: GlassesModel] = [
+                "rayban_meta": .rayBanMeta, "meta_rayban_display": .metaRayBanDisplay, "oakley_meta_hstn": .oakleyMetaHSTN,
+                "oakley_meta_vanguard": .oakleyMetaVanguard, "rayban_meta_optics": .rayBanMetaOptics, "meta_glasses": .metaGlasses,
+            ]
+            let g = try kit.pairGlasses(model: models[call.params["model"] as? String ?? ""] ?? .rayBanMeta)
             g.powerOn()
             g.unfold()
             g.don()
             g.services.camera.setCameraFeed(fileURL: feed)
             g.services.camera.setCapturedImage(fileURL: photo)
+            g.services.cameraCapture.setCapturedPhoto(fileURL: photo)
             mockGlasses = g
         } catch {
             await kit.disable()
@@ -656,6 +1035,57 @@ final class GlassesController {
         var o = status()
         o["mockFeedCodec"] = codec
         return .ok(o)
+    }
+
+    /// Drives the Mock Device Kit's simulated glasses (debug builds, after mock enabled true), so a
+    /// page can exercise every event without real glasses.
+    private func mockEvent(_ call: NativeExtCall) -> NativeExtResult {
+        guard Self.mockAllowed else { return .error(code: "mock_unavailable", message: "the mock glasses run in debug builds only") }
+        guard let g = mockGlasses else { return .error(code: "not_active", message: "turn the mock glasses on first (mock enabled true)") }
+        let ev = call.params["event"] as? String ?? ""
+        let value = call.params["value"] as? Int ?? 0
+        let text = call.params["text"] as? String ?? ""
+        var out: [String: Any] = ["event": ev]
+        switch ev {
+        case "power_on": g.powerOn()
+        case "power_off": g.powerOff()
+        case "don": g.don()
+        case "doff": g.doff()
+        case "fold": g.fold()
+        case "unfold": g.unfold()
+        case "battery": g.setBatteryLevel(value)
+        case "charging": g.setChargingState(value != 0 ? .charging : .notCharging)
+        case "thermal":
+            let levels: [ThermalLevel] = [.none, .light, .moderate, .severe, .critical, .emergency, .shutdown]
+            g.setThermalLevel(levels[max(0, min(levels.count - 1, value))])
+        case "tap": g.services.captouch.tap()
+        case "tap_and_hold": g.services.captouch.tapAndHold()
+        case "nav_up": g.services.input.navUp()
+        case "nav_down": g.services.input.navDown()
+        case "nav_left": g.services.input.navLeft()
+        case "nav_right": g.services.input.navRight()
+        case "select": g.services.input.select()
+        case "back": g.services.input.back()
+        case "capture": g.services.input.capture(pressType: text == "hold" ? .hold : text == "double" ? .doublePress : .shortPress)
+        case "action_button": g.services.input.button()
+        case "drag": g.services.input.drag(action: .move, x: 0, y: 0, dx: Float(value), dy: 0)
+        case "transcription":
+            g.services.speech.simulateTranscription(text: text, isFinal: value != 0, confidence: 0.9)
+        case "speech_locale": g.services.speech.setLocale(text)
+        case "voice_launch": out["action"] = g.services.voiceInvocation.simulateLaunchAppAction() ?? NSNull()
+        case "photo_failure": g.services.cameraCapture.simulateCaptureFailure()
+        case "app_update_required": g.services.setDATAppUpdateRequirementEnabled(value != 0)
+        case "firmware_update_required": g.services.setFirmwareUpdateRequirementEnabled(value != 0)
+        case "camera_permission":
+            MockDeviceKit.shared.permissions.set(.camera, value != 0 ? .granted : .denied)
+        case "microphone_permission":
+            MockDeviceKit.shared.permissions.set(.microphone, value != 0 ? .granted : .denied)
+        case "display_click":
+            out["delivered"] = g.services.display.sendClick(identifier: text)
+        default:
+            return .error(code: "bad_request", message: "unknown mock event")
+        }
+        return .ok(out)
     }
 
     // MARK: - Helpers
@@ -761,6 +1191,14 @@ final class GlassesFramePipe: @unchecked Sendable {
         scheduled = true
         lock.unlock()
         if go { queue.async { self.drain() } }
+    }
+
+    /// On the SDK's audio thread: the stream's PCM goes to an open clip only.
+    func pushAudio(_ a: AudioFrame, gen g: Int64) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard g == gen, let clip else { return }
+        clip.appendAudio(a.pcmBuffer, at: a.presentationTimeStamp)
     }
 
     private func drain() {

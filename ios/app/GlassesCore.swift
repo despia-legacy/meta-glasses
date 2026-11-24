@@ -275,3 +275,103 @@ enum GlassesCore {
         }
     }
 }
+
+/// The display view tree a page sends to `display_send`: JSON, parsed and checked here before any
+/// DAT view is made. Foundation only; the Java twin is GlassesCore.DisplayTree and both accept and
+/// refuse the same documents.
+///
+/// A node is an object with `type` and string, number or boolean attributes:
+/// `box` (children; direction row|column|row_reverse|column_reverse, spacing, padding, align,
+/// cross, wrap, background none|card, id; padding_top, padding_bottom, padding_start and
+/// padding_end override padding on one edge), `text` (text, style heading|body|meta, color
+/// primary|secondary), `button` (label, style primary|secondary|outline, icon, id, primary),
+/// `buttons` (children: buttons only; align start|center|end), `icon` (name, style filled|outline)
+/// and `image` (src: an https URL; size icon|fill, radius none|small|medium). Every node also takes
+/// grow, shrink and self (start|center|end|stretch). Icon names are DAT's, in snake case.
+enum GlassesDisplayTree {
+    static let maxNodes = 64
+    static let maxDepth = 8
+
+    enum Kind: String { case box, text, button, buttons, icon, image }
+
+    struct Attrs {
+        var values: [String: String] = [:]
+        subscript(_ k: String) -> String? { values[k] }
+        func num(_ k: String) -> Double? { values[k].flatMap(Double.init) }
+        func bool(_ k: String) -> Bool? { values[k].map { $0 == "true" } }
+    }
+
+    struct Node {
+        let kind: Kind
+        let attrs: Attrs
+        let children: [Node]
+    }
+
+    struct Invalid: Error, CustomStringConvertible {
+        let description: String
+    }
+
+    static func parse(_ json: String) throws -> Node {
+        guard let data = json.data(using: .utf8),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw Invalid(description: "content is not a JSON object")
+        }
+        var count = 0
+        return try node(root, depth: 1, count: &count)
+    }
+
+    private static func node(_ o: [String: Any], depth: Int, count: inout Int) throws -> Node {
+        count += 1
+        guard count <= maxNodes else { throw Invalid(description: "more than \(maxNodes) nodes") }
+        guard depth <= maxDepth else { throw Invalid(description: "deeper than \(maxDepth) levels") }
+        guard let t = o["type"] as? String, let kind = Kind(rawValue: t) else { throw Invalid(description: "unknown node type") }
+        var attrs = Attrs()
+        var children: [Node] = []
+        for (k, v) in o.sorted(by: { $0.key < $1.key }) where k != "type" {
+            if k == "children" {
+                guard kind == .box || kind == .buttons, let list = v as? [Any] else { throw Invalid(description: "\(t) has no children") }
+                for c in list {
+                    guard let co = c as? [String: Any] else { throw Invalid(description: "a child is not an object") }
+                    let child = try node(co, depth: depth + 1, count: &count)
+                    if kind == .buttons && child.kind != .button { throw Invalid(description: "buttons holds buttons only") }
+                    children.append(child)
+                }
+                continue
+            }
+            guard allowed(kind).contains(k) else { throw Invalid(description: "\(t) has no attribute \(k)") }
+            if let b = v as? Bool, CFGetTypeID(v as CFTypeRef) == CFBooleanGetTypeID() {
+                attrs.values[k] = b ? "true" : "false"
+            } else if let n = v as? NSNumber {
+                guard n.doubleValue.isFinite, abs(n.doubleValue) <= 10_000 else { throw Invalid(description: "\(k) is out of range") }
+                attrs.values[k] = String(n.doubleValue)
+            } else if let s = v as? String {
+                guard s.utf16.count <= 512 else { throw Invalid(description: "\(k) is too long") }
+                attrs.values[k] = s
+            } else {
+                throw Invalid(description: "\(k) must be a string, number or boolean")
+            }
+        }
+        if let id = attrs["id"], !isId(id) { throw Invalid(description: "id must be 1 to 32 of a-z, A-Z, 0-9, _ and -") }
+        if kind == .image, !(attrs["src"] ?? "").hasPrefix("https://") { throw Invalid(description: "image src must be an https URL") }
+        return Node(kind: kind, attrs: attrs, children: children)
+    }
+
+    static func allowed(_ k: Kind) -> Set<String> {
+        let common: Set<String> = ["grow", "shrink", "self"]
+        switch k {
+        case .box: return common.union(["direction", "spacing", "padding", "padding_top", "padding_bottom", "padding_start",
+                                           "padding_end", "align", "cross", "wrap", "background", "id"])
+        case .text: return common.union(["text", "style", "color"])
+        case .button: return common.union(["label", "style", "icon", "id", "primary"])
+        case .buttons: return common.union(["align"])
+        case .icon: return common.union(["name", "style"])
+        case .image: return common.union(["src", "size", "radius"])
+        }
+    }
+
+    static func isId(_ s: String) -> Bool {
+        !s.isEmpty && s.utf8.count <= 32 && s.utf8.allSatisfy {
+            ($0 >= 0x30 && $0 <= 0x39) || ($0 >= 0x41 && $0 <= 0x5a) || ($0 >= 0x61 && $0 <= 0x7a) || $0 == 0x5f || $0 == 0x2d
+        }
+    }
+}

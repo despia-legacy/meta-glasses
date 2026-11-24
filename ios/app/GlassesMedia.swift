@@ -119,6 +119,11 @@ final class GlassesClipWriter {
     private var writer: AVAssetWriter?
     private var input: AVAssetWriterInput?
     private var adaptor: AVAssetWriterInputPixelBufferAdaptor?
+    /// The stream's audio (PCM from DAT at the stream's rate), encoded as AAC; nil for a silent clip.
+    private let audioRate: Int?
+    private let audioChannels: Int
+    private var audioInput: AVAssetWriterInput?
+    private(set) var audioSamples = 0
     private var width = 0
     private var height = 0
     private var first: CMTime?
@@ -128,9 +133,31 @@ final class GlassesClipWriter {
     private(set) var failed = false
     private var finished = false
 
-    init(url: URL, fps: Int) {
+    init(url: URL, fps: Int, audioRate: Int? = nil, audioChannels: Int = 1) {
         self.url = url
         self.fps = fps
+        self.audioRate = audioRate
+        self.audioChannels = audioChannels
+    }
+
+    /// Appends the stream's PCM (after the first video frame; earlier audio has no clip time).
+    func appendAudio(_ pcm: AVAudioPCMBuffer, at pts: CMTime) {
+        guard !finished, !failed, let audioInput, let first, pts >= first, audioInput.isReadyForMoreMediaData else { return }
+        var asbd = pcm.format.streamDescription.pointee
+        var format: CMAudioFormatDescription?
+        guard CMAudioFormatDescriptionCreate(allocator: nil, asbd: &asbd, layoutSize: 0, layout: nil, magicCookieSize: 0,
+                                             magicCookie: nil, extensions: nil, formatDescriptionOut: &format) == noErr,
+              let format else { return }
+        var timing = CMSampleTimingInfo(duration: CMTime(value: 1, timescale: CMTimeScale(asbd.mSampleRate)),
+                                        presentationTimeStamp: pts, decodeTimeStamp: .invalid)
+        var sample: CMSampleBuffer?
+        guard CMSampleBufferCreate(allocator: nil, dataBuffer: nil, dataReady: false, makeDataReadyCallback: nil, refcon: nil,
+                                   formatDescription: format, sampleCount: CMItemCount(pcm.frameLength), sampleTimingEntryCount: 1,
+                                   sampleTimingArray: &timing, sampleSizeEntryCount: 0, sampleSizeArray: nil, sampleBufferOut: &sample) == noErr,
+              let sample,
+              CMSampleBufferSetDataBufferFromAudioBufferList(sample, blockBufferAllocator: nil, blockBufferMemoryAllocator: nil,
+                                                             flags: 0, bufferList: pcm.audioBufferList) == noErr else { return }
+        if audioInput.append(sample) { audioSamples += 1 }
     }
 
     /// Appends one decoded frame. False when it was not taken.
@@ -179,6 +206,17 @@ final class GlassesClipWriter {
             return false
         }
         writer.add(input)
+        if let audioRate {
+            let a = AVAssetWriterInput(mediaType: .audio, outputSettings: [
+                AVFormatIDKey: kAudioFormatMPEG4AAC, AVSampleRateKey: audioRate, AVNumberOfChannelsKey: audioChannels,
+                AVEncoderBitRateKey: 64_000 * audioChannels,
+            ])
+            a.expectsMediaDataInRealTime = true
+            if writer.canAdd(a) {
+                writer.add(a)
+                audioInput = a
+            }
+        }
         guard writer.startWriting() else {
             failed = true
             return false
@@ -203,6 +241,7 @@ final class GlassesClipWriter {
             return done(false)
         }
         input.markAsFinished()
+        audioInput?.markAsFinished()
         writer.endSession(atSourceTime: last + CMTime(value: 1, timescale: CMTimeScale(max(1, fps))))
         writer.finishWriting { done(writer.status == .completed) }
     }

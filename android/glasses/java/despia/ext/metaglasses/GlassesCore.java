@@ -348,4 +348,307 @@ public final class GlassesCore {
             return c;
         }
     }
+
+    // ---------------------------------------------------------------- display view tree
+
+    /**
+     * The view tree a page sends to the glasses' display (display_send), checked before any DAT
+     * view is made. The Swift twin is GlassesDisplayTree in ios/app/GlassesCore.swift; both accept
+     * and refuse the same documents. A node is an object with {@code type} and string, number or
+     * boolean attributes: box (children; direction, spacing, padding, padding_top, padding_bottom,
+     * padding_start, padding_end, align, cross, wrap, background, id), text (text, style, color),
+     * button (label, style, icon, id, primary), buttons (children: buttons only; align), icon
+     * (name, style) and image (src: an https URL; size, radius). Every node also takes grow, shrink
+     * and self. Its own small JSON reader keeps this file free of Android.
+     */
+    public static final class DisplayTree {
+        public static final int MAX_NODES = 64;
+        public static final int MAX_DEPTH = 8;
+        static final java.util.List<String> KINDS = java.util.Arrays.asList("box", "text", "button", "buttons", "icon", "image");
+
+        public static final class Invalid extends Exception {
+            Invalid(String message) {
+                super(message);
+            }
+        }
+
+        public static final class Node {
+            public final String kind;
+            public final java.util.Map<String, String> attrs;
+            public final java.util.List<Node> children;
+
+            Node(String kind, java.util.Map<String, String> attrs, java.util.List<Node> children) {
+                this.kind = kind;
+                this.attrs = attrs;
+                this.children = children;
+            }
+
+            public String get(String k) {
+                return attrs.get(k);
+            }
+
+            public Double num(String k) {
+                String v = attrs.get(k);
+                if (v == null) return null;
+                try {
+                    return Double.valueOf(v);
+                } catch (NumberFormatException e) {
+                    return null;
+                }
+            }
+
+            public Boolean bool(String k) {
+                String v = attrs.get(k);
+                return v == null ? null : v.equals("true");
+            }
+        }
+
+        public static Node parse(String json) throws Invalid {
+            Object root;
+            try {
+                Reader r = new Reader(json == null ? "" : json);
+                root = r.value(0);
+                r.skipSpace();
+                if (!r.atEnd()) throw new Invalid("content is not a JSON object");
+            } catch (IllegalArgumentException e) {
+                throw new Invalid("content is not a JSON object");
+            }
+            if (!(root instanceof java.util.Map)) throw new Invalid("content is not a JSON object");
+            int[] count = {0};
+            return node(cast(root), 1, count);
+        }
+
+        @SuppressWarnings("unchecked")
+        private static java.util.Map<String, Object> cast(Object o) {
+            return (java.util.Map<String, Object>) o;
+        }
+
+        private static Node node(java.util.Map<String, Object> o, int depth, int[] count) throws Invalid {
+            count[0]++;
+            if (count[0] > MAX_NODES) throw new Invalid("more than " + MAX_NODES + " nodes");
+            if (depth > MAX_DEPTH) throw new Invalid("deeper than " + MAX_DEPTH + " levels");
+            Object t = o.get("type");
+            if (!(t instanceof String) || !KINDS.contains(t)) throw new Invalid("unknown node type");
+            String kind = (String) t;
+            java.util.Map<String, String> attrs = new java.util.TreeMap<>();
+            java.util.List<Node> children = new java.util.ArrayList<>();
+            for (String k : new java.util.TreeSet<>(o.keySet())) {
+                if (k.equals("type")) continue;
+                Object v = o.get(k);
+                if (k.equals("children")) {
+                    if (!(kind.equals("box") || kind.equals("buttons")) || !(v instanceof java.util.List)) {
+                        throw new Invalid(kind + " has no children");
+                    }
+                    for (Object c : (java.util.List<?>) v) {
+                        if (!(c instanceof java.util.Map)) throw new Invalid("a child is not an object");
+                        Node child = node(cast(c), depth + 1, count);
+                        if (kind.equals("buttons") && !child.kind.equals("button")) throw new Invalid("buttons holds buttons only");
+                        children.add(child);
+                    }
+                    continue;
+                }
+                if (!allowed(kind).contains(k)) throw new Invalid(kind + " has no attribute " + k);
+                if (v instanceof Boolean) {
+                    attrs.put(k, ((Boolean) v) ? "true" : "false");
+                } else if (v instanceof Double) {
+                    double d = (Double) v;
+                    if (Double.isNaN(d) || Double.isInfinite(d) || Math.abs(d) > 10_000) throw new Invalid(k + " is out of range");
+                    attrs.put(k, Double.toString(d));
+                } else if (v instanceof String) {
+                    if (((String) v).length() > 512) throw new Invalid(k + " is too long");
+                    attrs.put(k, (String) v);
+                } else {
+                    throw new Invalid(k + " must be a string, number or boolean");
+                }
+            }
+            String id = attrs.get("id");
+            if (id != null && !isId(id)) throw new Invalid("id must be 1 to 32 of a-z, A-Z, 0-9, _ and -");
+            if (kind.equals("image")) {
+                String src = attrs.get("src");
+                if (src == null || !src.startsWith("https://")) throw new Invalid("image src must be an https URL");
+            }
+            return new Node(kind, attrs, children);
+        }
+
+        public static java.util.Set<String> allowed(String kind) {
+            java.util.Set<String> s = new java.util.HashSet<>(java.util.Arrays.asList("grow", "shrink", "self"));
+            switch (kind) {
+                case "box":
+                    s.addAll(java.util.Arrays.asList("direction", "spacing", "padding", "padding_top", "padding_bottom",
+                            "padding_start", "padding_end", "align", "cross", "wrap", "background", "id"));
+                    break;
+                case "text":
+                    s.addAll(java.util.Arrays.asList("text", "style", "color"));
+                    break;
+                case "button":
+                    s.addAll(java.util.Arrays.asList("label", "style", "icon", "id", "primary"));
+                    break;
+                case "buttons":
+                    s.add("align");
+                    break;
+                case "icon":
+                    s.addAll(java.util.Arrays.asList("name", "style"));
+                    break;
+                default:
+                    s.addAll(java.util.Arrays.asList("src", "size", "radius"));
+            }
+            return s;
+        }
+
+        public static boolean isId(String s) {
+            if (s.isEmpty() || s.length() > 32) return false;
+            for (int i = 0; i < s.length(); i++) {
+                char c = s.charAt(i);
+                if (!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_' || c == '-')) return false;
+            }
+            return true;
+        }
+
+        /** A strict RFC 8259 reader: objects, arrays, strings, numbers, true, false and null. */
+        static final class Reader {
+            private final String s;
+            private int i;
+
+            Reader(String s) {
+                this.s = s;
+            }
+
+            boolean atEnd() {
+                return i >= s.length();
+            }
+
+            void skipSpace() {
+                while (i < s.length() && (s.charAt(i) == ' ' || s.charAt(i) == '\t' || s.charAt(i) == '\n' || s.charAt(i) == '\r')) i++;
+            }
+
+            private IllegalArgumentException bad() {
+                return new IllegalArgumentException("bad JSON at " + i);
+            }
+
+            Object value(int depth) {
+                if (depth > 64) throw bad();
+                skipSpace();
+                if (atEnd()) throw bad();
+                char c = s.charAt(i);
+                if (c == '{') return object(depth);
+                if (c == '[') return array(depth);
+                if (c == '"') return string();
+                if (s.startsWith("true", i)) {
+                    i += 4;
+                    return Boolean.TRUE;
+                }
+                if (s.startsWith("false", i)) {
+                    i += 5;
+                    return Boolean.FALSE;
+                }
+                if (s.startsWith("null", i)) {
+                    i += 4;
+                    return null;
+                }
+                return number();
+            }
+
+            private java.util.Map<String, Object> object(int depth) {
+                java.util.Map<String, Object> m = new java.util.LinkedHashMap<>();
+                i++;
+                skipSpace();
+                if (!atEnd() && s.charAt(i) == '}') {
+                    i++;
+                    return m;
+                }
+                while (true) {
+                    skipSpace();
+                    if (atEnd() || s.charAt(i) != '"') throw bad();
+                    String k = string();
+                    skipSpace();
+                    if (atEnd() || s.charAt(i) != ':') throw bad();
+                    i++;
+                    m.put(k, value(depth + 1));
+                    skipSpace();
+                    if (atEnd()) throw bad();
+                    char c = s.charAt(i++);
+                    if (c == '}') return m;
+                    if (c != ',') throw bad();
+                }
+            }
+
+            private java.util.List<Object> array(int depth) {
+                java.util.List<Object> l = new java.util.ArrayList<>();
+                i++;
+                skipSpace();
+                if (!atEnd() && s.charAt(i) == ']') {
+                    i++;
+                    return l;
+                }
+                while (true) {
+                    l.add(value(depth + 1));
+                    skipSpace();
+                    if (atEnd()) throw bad();
+                    char c = s.charAt(i++);
+                    if (c == ']') return l;
+                    if (c != ',') throw bad();
+                }
+            }
+
+            private String string() {
+                StringBuilder b = new StringBuilder();
+                i++;
+                while (true) {
+                    if (atEnd()) throw bad();
+                    char c = s.charAt(i++);
+                    if (c == '"') return b.toString();
+                    if (c < 0x20) throw bad();
+                    if (c != '\\') {
+                        b.append(c);
+                        continue;
+                    }
+                    if (atEnd()) throw bad();
+                    char e = s.charAt(i++);
+                    switch (e) {
+                        case '"': b.append('"'); break;
+                        case '\\': b.append('\\'); break;
+                        case '/': b.append('/'); break;
+                        case 'b': b.append('\b'); break;
+                        case 'f': b.append('\f'); break;
+                        case 'n': b.append('\n'); break;
+                        case 'r': b.append('\r'); break;
+                        case 't': b.append('\t'); break;
+                        case 'u':
+                            if (i + 4 > s.length()) throw bad();
+                            try {
+                                b.append((char) Integer.parseInt(s.substring(i, i + 4), 16));
+                            } catch (NumberFormatException x) {
+                                throw bad();
+                            }
+                            i += 4;
+                            break;
+                        default: throw bad();
+                    }
+                }
+            }
+
+            private Double number() {
+                int start = i;
+                if (i < s.length() && s.charAt(i) == '-') i++;
+                if (i >= s.length() || !Character.isDigit(s.charAt(i))) throw bad();
+                if (s.charAt(i) == '0') {
+                    i++;
+                } else {
+                    while (i < s.length() && Character.isDigit(s.charAt(i))) i++;
+                }
+                if (i < s.length() && s.charAt(i) == '.') {
+                    i++;
+                    if (i >= s.length() || !Character.isDigit(s.charAt(i))) throw bad();
+                    while (i < s.length() && Character.isDigit(s.charAt(i))) i++;
+                }
+                if (i < s.length() && (s.charAt(i) == 'e' || s.charAt(i) == 'E')) {
+                    i++;
+                    if (i < s.length() && (s.charAt(i) == '+' || s.charAt(i) == '-')) i++;
+                    if (i >= s.length() || !Character.isDigit(s.charAt(i))) throw bad();
+                    while (i < s.length() && Character.isDigit(s.charAt(i))) i++;
+                }
+                return Double.valueOf(s.substring(start, i));
+            }
+        }
+    }
 }
