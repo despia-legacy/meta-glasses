@@ -77,6 +77,16 @@ public class GlassesMockFlowTest {
         return false;
     }
 
+    private boolean sawState(String name, String state) {
+        synchronized (events) {
+            for (JSONObject e : events) {
+                JSONObject d = e.optJSONObject("data");
+                if (name.equals(e.optString("event")) && d != null && state.equals(d.optString("state"))) return true;
+            }
+        }
+        return false;
+    }
+
     @Test
     public void mockFlowInOrder() throws Exception {
         Instrumentation in = InstrumentationRegistry.getInstrumentation();
@@ -143,6 +153,10 @@ public class GlassesMockFlowTest {
         ok("mock_event", "event", "capture", "text", "hold");
         pause(800);
         ok("inputs_stop");
+        // A captouch tap is the glasses' pause gesture (the mock kit pauses the session, as real glasses do).
+        assertTrue("tap paused the session", sawState("session", "paused"));
+        ok("resume");
+        pause(800);
         ok("voice_start");
         ok("mock_event", "event", "voice_launch");
         pause(800);

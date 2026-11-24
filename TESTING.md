@@ -15,7 +15,7 @@ Requirements: a JDK 17 or later for the Java checks, `swiftc` on macOS for the S
 
 ## 2. Debug simulator flow (emulator or simulator, no glasses)
 
-The `mock` route turns on DAT's mock device kit in debug builds; release builds answer `mock_unavailable`. The flow below is the one a page runs: mock on (`meta_rayban_display`), status, devices, permission, session start, stream start with audio, frame, a stream photo, a refused still while streaming (`busy`), a 2 second clip, media, speech with a simulated transcription, motion, inputs (tap, nav up, capture hold), voice launch, the display (a view tree, a simulated click, a refused tree, clear), pause and resume, battery and thermal events, stop, a still photo (`resolution` and `quality`), session stop, mock off.
+The `mock` route turns on DAT's mock device kit in debug builds; release builds answer `mock_unavailable`. The flow below is the one a page runs: mock on (`meta_rayban_display`), status, devices, permission, session start, stream start with audio, frame, a stream photo, a refused still while streaming (`busy`), a 2 second clip, media, speech with a simulated transcription, motion, inputs (tap, nav up, capture hold; the tap is the glasses' pause gesture, so the flow resumes the session), voice launch, the display (a view tree, a simulated click, a refused tree, clear), pause and resume, battery and thermal events, stop, a still photo (`resolution` and `quality`), session stop, mock off.
 
 ### Android: native test
 
