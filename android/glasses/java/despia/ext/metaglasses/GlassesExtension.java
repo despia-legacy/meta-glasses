@@ -32,6 +32,7 @@ import com.meta.wearable.dat.camera.photo.types.PhotoCaptureData;
 import com.meta.wearable.dat.camera.photo.types.PhotoError;
 import com.meta.wearable.dat.camera.photo.types.PhotoQuality;
 import com.meta.wearable.dat.camera.photo.types.PhotoResolution;
+import com.meta.wearable.dat.camera.photo.types.PhotoState;
 import com.meta.wearable.dat.camera.types.AudioCodec;
 import com.meta.wearable.dat.camera.types.AudioFrame;
 import com.meta.wearable.dat.camera.types.AudioSampleRate;
@@ -174,8 +175,11 @@ public final class GlassesExtension implements NativeExtension {
     private boolean audio;
     private int audioRate = 16000;
     private int audioChannels = 1;
+    /** The standalone still photo's own Camera and Photo (never the stream's: Meta, "Camera Capture"). */
+    private Camera stillCamera;
     private Photo cameraPhoto;
     private CoroutineScope photoScope;
+    private boolean stillCaptured;
     private ExtResult.Callback stillReply;
     private Object stillTimeout;
     private String stillResolution;
@@ -666,6 +670,10 @@ public final class GlassesExtension implements NativeExtension {
             reply.reply(ExtResult.error("busy", "the stream is already " + core.state));
             return;
         }
+        if (stillReply != null) {
+            reply.reply(ExtResult.error("busy", "a still photo is being taken"));
+            return;
+        }
         Object q = call.params.get("quality");
         Object f = call.params.get("fps");
         String wantQuality = q instanceof String ? (String) q : "medium";
@@ -820,6 +828,7 @@ public final class GlassesExtension implements NativeExtension {
                             : ExtResult.error("no_device", "the glasses session stopped before streaming"), "start_failed");
                 }
             }
+            if (stillReply != null) finishStill(why);
             sensors.sessionEnded();
             screen.sessionEnded();
             sessionSelector = null;
@@ -850,6 +859,7 @@ public final class GlassesExtension implements NativeExtension {
         sessionScope = null;
         DatInterop.cancel(sc);
         teardown(reason);
+        if (stillReply != null) finishStill(ExtResult.error("no_device", "the glasses session ended before the photo arrived"));
         sensors.sessionEnded();
         screen.sessionEnded();
         failWaiters(ExtResult.error("no_device", "the glasses session was stopped"));
@@ -862,7 +872,7 @@ public final class GlassesExtension implements NativeExtension {
 
     /** The camera, speech, motion, inputs and display are all off: the session has no work left. */
     private void releaseSessionIfIdle() {
-        if (session == null || camera != null || !core.state.equals("idle") || !sessionWaiters.isEmpty()
+        if (session == null || camera != null || stillCamera != null || stillReply != null || !core.state.equals("idle") || !sessionWaiters.isEmpty()
                 || sensors.active() || screen.active()) {
             return;
         }
@@ -1158,13 +1168,9 @@ public final class GlassesExtension implements NativeExtension {
         liveGen = 0;
         DatInterop.cancel(frameScope);
         DatInterop.cancel(streamScope);
-        DatInterop.cancel(photoScope);
         frameScope = null;
         streamScope = null;
-        photoScope = null;
-        cameraPhoto = null;
-        if (stillReply != null) finishStill(ExtResult.error("capture_failed", "the stream ended before the photo arrived"));
-        // Camera.stop cascades to its stream and photo.
+        // Camera.stop cascades to its stream.
         if (camera != null) camera.stop();
         camera = null;
         stream = null;
@@ -1257,15 +1263,19 @@ public final class GlassesExtension implements NativeExtension {
     }
 
     /**
-     * A high-quality still through DAT's Camera photo capability (DAT 1.0.0, experimental): the
-     * glasses take the picture at resolution and quality and transfer it, reporting photo_progress.
+     * A high-quality still through DAT's standalone photo capability (Camera.photo, experimental in
+     * DAT 1.1.0): the glasses take the picture at resolution and quality and transfer it, reporting
+     * photo_progress. Meta's "Camera Capture" guide (meta-wearables-dat-android, 1.1.0): the stream
+     * and the standalone photo compete for the camera, so a still needs the stream stopped; Photo
+     * starts when Camera.photo is first read, and a capture waits for PhotoState.STARTED. Photo is
+     * terminal after stop, so each still adds its own Camera to the shared session and stops it after.
      */
     private void stillPhoto(ExtCall call, ExtResult.Callback reply) {
-        if (!(core.state.equals("streaming") || core.state.equals("paused")) || camera == null) {
-            reply.reply(ExtResult.error("not_streaming", "start the stream first"));
+        if (!core.state.equals("idle")) {
+            reply.reply(ExtResult.error("busy", "stop the stream first: the stream and still photos share the glasses camera"));
             return;
         }
-        if (photoBusy) {
+        if (photoBusy || stillReply != null) {
             reply.reply(ExtResult.error("busy", "a photo is already being taken"));
             return;
         }
@@ -1274,32 +1284,75 @@ public final class GlassesExtension implements NativeExtension {
         PhotoResolution pr = res.equals("small") ? PhotoResolution.SMALL : res.equals("large") ? PhotoResolution.LARGE
                 : res.equals("full") ? PhotoResolution.FULL : PhotoResolution.MEDIUM;
         PhotoQuality pq = q.equals("low") ? PhotoQuality.LOW : q.equals("high") ? PhotoQuality.HIGH : PhotoQuality.MEDIUM;
-        if (cameraPhoto == null) {
-            Photo p = camera.getPhoto();
-            if (p == null) {
-                reply.reply(ExtResult.error("capture_failed", "the camera has no photo capability"));
-                return;
-            }
-            photoScope = DatInterop.mainScope();
-            DatInterop.collect(photoScope, p.getPhotoStream(), this::onStill);
-            DatInterop.collect(photoScope, p.getErrors(), (PhotoError e) -> {
-                if (e != null && stillReply != null) finishStill(photoError(e));
-            });
-            DatInterop.collect(photoScope, p.getTransferProgressStream(), t -> ctx.emit("photo_progress",
-                    GlassesCapabilities.obj("received", t.getBytesReceived(), "total", t.getTotalBytes(), "fraction", t.getFraction())));
-            cameraPhoto = p;
-        }
         photoBusy = true;
         stillReply = reply;
         stillResolution = res;
         stillQuality = q;
+        stillCaptured = false;
         Object token = new Object();
         stillTimeout = token;
         long at = call.deadlineUptimeMillis > 0 ? call.deadlineUptimeMillis - 100 : SystemClock.uptimeMillis() + 20000;
         main.postAtTime(() -> {
             if (stillTimeout == token) finishStill(ExtResult.error("timeout", "no photo arrived from the glasses"));
         }, token, at);
-        cameraPhoto.capturePhoto(pr, pq);
+        openSession(call, r -> {
+            if (stillTimeout == token) finishStill(r);
+        }, null, sess -> {
+            if (stillTimeout == token) attachStill(sess, pr, pq);
+        });
+    }
+
+    /** The session is started: the still's own Camera, then its Photo, then one capture once STARTED. */
+    private void attachStill(DeviceSession s, PhotoResolution pr, PhotoQuality pq) {
+        if (mock && mockGlasses != null) {
+            // The mock kit's captured photo is the next image (Meta, "Camera Capture"): set it for each still.
+            File photo = new File(new File(ctx.dataDir(), "mock"), "photo.jpg");
+            if (photo.isFile()) mockGlasses.getServices().getCameraCapture().setCapturedPhoto(Uri.fromFile(photo));
+        }
+        // The stream settings do not apply to a still; DAT 1.1.0 has no Java no-argument StreamConfiguration.
+        DatResult<Camera, DeviceSessionError> c = SessionCameraExtensionsKt.addCamera(s, new StreamConfiguration(null, VideoQuality.MEDIUM, 24, false));
+        if (!c.isSuccess() || c.getOrNull() == null) {
+            finishStill(GlassesCapabilities.session(c.errorOrNull()));
+            return;
+        }
+        stillCamera = c.getOrNull();
+        Photo p = stillCamera.getPhoto();
+        if (p == null) {
+            finishStill(ExtResult.error("capture_failed", "the camera has no photo capability"));
+            return;
+        }
+        cameraPhoto = p;
+        photoScope = DatInterop.mainScope();
+        // Collected in launch order on the main thread: the photo, error and progress collectors are
+        // subscribed before the state collector sees STARTED and asks for the capture.
+        DatInterop.collect(photoScope, p.getPhotoStream(), this::onStill);
+        DatInterop.collect(photoScope, p.getErrors(), (PhotoError e) -> {
+            if (e != null && stillReply != null) finishStill(photoError(e));
+        });
+        DatInterop.collect(photoScope, p.getTransferProgressStream(), t -> ctx.emit("photo_progress",
+                GlassesCapabilities.obj("received", t.getBytesReceived(), "total", t.getTotalBytes(), "fraction", t.getFraction())));
+        DatInterop.collect(photoScope, p.getState(), (PhotoState st) -> {
+            if (st == PhotoState.STARTED && !stillCaptured && stillReply != null && cameraPhoto == p) {
+                stillCaptured = true;
+                p.capturePhoto(pr, pq);
+            } else if (st == PhotoState.STOPPED && stillCaptured && stillReply != null && cameraPhoto == p) {
+                finishStill(ExtResult.error("capture_failed", "the photo stopped before it arrived"));
+            }
+        });
+    }
+
+    /** Ends the still's Photo and Camera; the session stays while another capability uses it. */
+    private void endStill() {
+        CoroutineScope sc = photoScope;
+        photoScope = null;
+        DatInterop.cancel(sc);
+        Photo p = cameraPhoto;
+        cameraPhoto = null;
+        Camera c = stillCamera;
+        stillCamera = null;
+        if (p != null) p.stop();
+        // Camera.stop cascades to its photo.
+        if (c != null) c.stop();
     }
 
     private void finishStill(ExtResult r) {
@@ -1308,6 +1361,8 @@ public final class GlassesExtension implements NativeExtension {
         if (stillTimeout != null) main.removeCallbacksAndMessages(stillTimeout);
         stillTimeout = null;
         photoBusy = false;
+        endStill();
+        releaseSessionIfIdle();
         if (reply != null) reply.reply(r);
     }
 
@@ -1317,6 +1372,8 @@ public final class GlassesExtension implements NativeExtension {
         stillReply = null;
         if (stillTimeout != null) main.removeCallbacksAndMessages(stillTimeout);
         stillTimeout = null;
+        endStill();
+        releaseSessionIfIdle();
         String res = stillResolution;
         String q = stillQuality;
         String id = newId("p");

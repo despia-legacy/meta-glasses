@@ -111,7 +111,12 @@ final class GlassesController {
     private var audio = false
     private var audioRate = 16000
     private var audioChannels = 1
+    /// The standalone still photo's own Camera and Photo (never the stream's: Meta, "Camera Capture").
+    private var stillCamera: Camera?
     private var cameraPhoto: Photo?
+    private var stillBusy = false
+    private var stillGen = 0
+    private var stillState: PhotoState?
     private var stillData: PhotoCaptureData?
     private var stillError: PhotoError?
     private var savedAudio: (AVAudioSession.Category, AVAudioSession.Mode, AVAudioSession.CategoryOptions)?
@@ -339,6 +344,7 @@ final class GlassesController {
             return .error(code: "registration_required", message: "connect the app to Meta AI first (register)")
         }
         guard core.state == "idle" else { return .error(code: "busy", message: "the stream is already \(core.state)") }
+        guard !stillBusy else { return .error(code: "busy", message: "a still photo is being taken") }
         let wantQuality = call.params["quality"] as? String ?? "medium"
         let wantFps = GlassesCore.frameRate(call.params["fps"] as? Int ?? 24)
         let wantAudio = call.params["audio"] as? Bool ?? false
@@ -525,7 +531,7 @@ final class GlassesController {
 
     /// The camera, speech, motion, inputs and display are all off: the session has no work left.
     private func releaseSessionIfIdle() {
-        guard session != nil, camera == nil, !sensors.active, !display.active else { return }
+        guard session != nil, camera == nil, stillCamera == nil, !stillBusy, !sensors.active, !display.active else { return }
         endSession("idle")
     }
 
@@ -728,11 +734,10 @@ final class GlassesController {
         pipe.end()
         streamTokens?.clear()
         streamTokens = nil
-        // camera.stop cascades to its stream and photo.
+        // camera.stop cascades to its stream.
         camera?.stop()
         camera = nil
         stream = nil
-        cameraPhoto = nil
         server?.endLive()
         releaseSessionIfIdle()
     }
@@ -780,48 +785,96 @@ final class GlassesController {
         return .ok(m)
     }
 
-    /// A high-quality still through DAT's Camera.photo (DAT 1.0.0, experimental): the glasses take
-    /// the picture at `resolution` and `quality` and transfer it, reporting `photo_progress`.
+    /// A high-quality still through DAT's standalone photo capability (Camera.photo, experimental in
+    /// DAT 1.1.0): the glasses take the picture at `resolution` and `quality` and transfer it,
+    /// reporting `photo_progress`. Meta's "Camera Capture" guide (meta-wearables-dat-ios, 1.1.0): the
+    /// stream and the standalone photo compete for the camera, so a still needs the stream stopped;
+    /// listeners go on before `start()`, and a capture before `.started` publishes `notReady`. Each
+    /// still adds its own Camera to the shared session and stops it after delivery.
     private func stillPhoto(_ call: NativeExtCall) async -> NativeExtResult {
-        guard core.state == "streaming" || core.state == "paused", let camera else {
-            return .error(code: "not_streaming", message: "start the stream first")
+        guard core.state == "idle" else {
+            return .error(code: "busy", message: "stop the stream first: the stream and still photos share the glasses camera")
         }
-        guard !photoBusy else { return .error(code: "busy", message: "a photo is already being taken") }
+        guard !photoBusy, !stillBusy else { return .error(code: "busy", message: "a photo is already being taken") }
         let resWord = call.params["resolution"] as? String ?? "medium"
         let qWord = call.params["quality"] as? String ?? "medium"
         let res: PhotoResolution = ["small": .small, "large": .large, "full": .full][resWord] ?? .medium
         let q: PhotoQuality = ["low": .low, "high": .high][qWord] ?? .medium
+        stillBusy = true
         photoBusy = true
+        stillGen += 1
+        let sg = stillGen
+        stillState = nil
         stillData = nil
         stillError = nil
+        let bag = ListenerTokenBag()
         defer {
-            photoBusy = false
+            bag.clear()
+            cameraPhoto?.stop()
+            // camera.stop cascades to its photo.
+            stillCamera?.stop()
+            cameraPhoto = nil
+            stillCamera = nil
+            stillState = nil
             stillData = nil
+            stillBusy = false
+            photoBusy = false
+            releaseSessionIfIdle()
         }
-        let gen = core.gen
-        if cameraPhoto == nil, let bag = streamTokens {
-            let p = camera.photo
-            p.photoDataPublisher.listen { [weak self] d in
-                DispatchQueue.main.async { MainActor.assumeIsolated { if self?.core.gen == gen { self?.stillData = d } } }
-            }.store(in: bag)
-            p.errorPublisher.listen { [weak self] e in
-                DispatchQueue.main.async { MainActor.assumeIsolated { if self?.core.gen == gen { self?.stillError = e } } }
-            }.store(in: bag)
-            p.transferProgressPublisher.listen { [weak self] t in
-                DispatchQueue.main.async {
-                    MainActor.assumeIsolated {
-                        self?.context.emit("photo_progress", ["received": t.bytesReceived, "total": t.totalBytes, "fraction": t.fraction])
-                    }
+        if let e = await openSession(call, device: nil) { return e }
+        guard let s = session, call.isActive else { return .error(code: "timeout", message: "the glasses did not connect in time") }
+        if mock, let g = mockGlasses {
+            // The mock kit's captured photo is the next image (Meta, "Camera Capture"): set it for each still.
+            let photo = context.dataDirectory.appendingPathComponent("mock", isDirectory: true).appendingPathComponent("photo.jpg")
+            if FileManager.default.fileExists(atPath: photo.path) { g.services.cameraCapture.setCapturedPhoto(fileURL: photo) }
+        }
+        let cam: Camera?
+        do {
+            // The stream settings do not apply to a still.
+            cam = try s.addCamera(config: StreamConfiguration(videoCodec: .raw, resolution: .medium, frameRate: 24))
+        } catch {
+            return Self.sessionError(error)
+        }
+        guard let cam else { return .error(code: "capture_failed", message: "the glasses offered no camera") }
+        stillCamera = cam
+        let p = cam.photo
+        cameraPhoto = p
+        p.statePublisher.listen { [weak self] st in
+            DispatchQueue.main.async { MainActor.assumeIsolated { if self?.stillGen == sg { self?.stillState = st } } }
+        }.store(in: bag)
+        p.photoDataPublisher.listen { [weak self] d in
+            DispatchQueue.main.async { MainActor.assumeIsolated { if self?.stillGen == sg { self?.stillData = d } } }
+        }.store(in: bag)
+        p.errorPublisher.listen { [weak self] e in
+            DispatchQueue.main.async { MainActor.assumeIsolated { if self?.stillGen == sg { self?.stillError = e } } }
+        }.store(in: bag)
+        p.transferProgressPublisher.listen { [weak self] t in
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    guard self?.stillGen == sg else { return }
+                    self?.context.emit("photo_progress", ["received": t.bytesReceived, "total": t.totalBytes, "fraction": t.fraction])
                 }
-            }.store(in: bag)
-            p.start()
-            cameraPhoto = p
+            }
+        }.store(in: bag)
+        p.start()
+        let ready = await waitUntil(call) { [weak self] in
+            self?.stillState == .started || self?.stillError != nil || self?.session !== s
         }
-        guard let p = cameraPhoto else { return .error(code: "capture_failed", message: "the camera has no photo capability") }
-        p.capturePhoto(resolution: res, quality: q)
-        let got = await waitUntil(call) { [weak self] in self?.stillData != nil || self?.stillError != nil || self?.core.gen != gen }
         if let e = stillError { return Self.photoError(e) }
-        guard got, let d = stillData else { return .error(code: "timeout", message: "no photo arrived from the glasses") }
+        guard session === s else {
+            return sessionError ?? .error(code: "no_device", message: "the glasses session ended before the photo arrived")
+        }
+        guard ready else { return .error(code: "timeout", message: "the glasses camera was not ready in time") }
+        p.capturePhoto(resolution: res, quality: q)
+        let got = await waitUntil(call) { [weak self] in
+            self?.stillData != nil || self?.stillError != nil || self?.session !== s || self?.stillState == .stopped
+        }
+        if let e = stillError { return Self.photoError(e) }
+        guard got, let d = stillData else {
+            if session !== s { return sessionError ?? .error(code: "no_device", message: "the glasses session ended before the photo arrived") }
+            if stillState == .stopped { return .error(code: "capture_failed", message: "the photo stopped before it arrived") }
+            return .error(code: "timeout", message: "no photo arrived from the glasses")
+        }
         let image = UIImage(data: d.imageData)
         let isJPEG = d.imageData.count > 2 && d.imageData[0] == 0xFF && d.imageData[1] == 0xD8
         guard let jpeg = isJPEG ? d.imageData : image?.jpegData(compressionQuality: GlassesMedia.photoQuality) else {

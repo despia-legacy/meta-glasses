@@ -185,7 +185,7 @@ Each route answers once in its own callback, listed in the tables below. Routes 
 | `permission` | `prompt` (bool), `kind` (`camera` or `microphone`, default `camera`) | `onGlassesPermission` | `bluetooth`, `camera` and `microphone` (`granted`, `denied`, or `unknown` while the app is not registered) | `glassesPermission` |
 | `start` | `quality` (`low`, `medium`, `high`), `fps` (2 to 30), `audio` (bool), `audio_rate` (`16000`, `44100`, `48000`), `audio_channels` (1 or 2), `device` | `onGlassesStart` | The state object with `live`, `frame` and `mediaBase` | `glassesStart` |
 | `stop` | none | `onGlassesStop` | The state object. Stops the camera only; other capabilities keep the session | `glassesStop` |
-| `photo` | `resolution` (`small`, `medium`, `large`, `full`), `quality` (`low`, `medium`, `high`) | `onGlassesPhoto` | The saved JPEG: `id`, `kind`, `url`, `width`, `height`. Also sent as the `media` event. Without parameters it captures from the running stream; with either parameter it takes a still photo and reports `photo_progress` | `glassesPhoto` |
+| `photo` | `resolution` (`small`, `medium`, `large`, `full`), `quality` (`low`, `medium`, `high`) | `onGlassesPhoto` | The saved JPEG: `id`, `kind`, `url`, `width`, `height`. Also sent as the `media` event. Without parameters it captures from the running stream. With either parameter it takes a standalone still photo and reports `photo_progress`; a still needs the stream stopped, so while streaming it answers `busy` | `glassesPhoto` |
 | `record_start` | `seconds` (1 to 60, required) | `onGlassesRecordStart` | `id`, `kind`, `seconds`, `audio` and the `url` of the clip being recorded. It ends by itself or with `record_stop` | `glassesRecordStart` |
 | `record_stop` | none | `onGlassesRecordStop` | The finished clip, also sent as the `media` event (`failed` when it could not be written) | `glassesRecordStop` |
 | `frame` | none | `onGlassesFrame` | `seq`, `width`, `height` and `jpeg` (base64) of the newest frame | `glassesFrame` |
@@ -298,6 +298,7 @@ Sources: Meta's DAT 1.1.0 changelog for [iOS](https://github.com/meta/meta-weara
 
 - **Experimental in DAT 1.1.0.** Speech, motion, inputs, voice, still photos and camera audio are marked experimental by Meta. Apps can build and test with them, but Meta does not yet allow publishing apps that use them. They may change in a later DAT release.
 - **Sessions.** A session created before registration fails and is reported as `registration_required`. Unregistering stops every session. A refused stream start reports a hot device, a low battery or the peak power limit as `device_limit`. A photo from the stream times out after 10 seconds.
+- **Still photos.** The stream and the standalone still photo share the glasses camera, so Meta asks apps to stop the stream before a still ([Camera Capture, iOS](https://github.com/meta/meta-wearables-dat-ios/blob/main/plugins/mwdat-ios/skills/camera-capture/SKILL.md) and [Android](https://github.com/meta/meta-wearables-dat-android/blob/main/plugins/mwdat-android/skills/camera-capture/SKILL.md), DAT 1.1.0, read 24 November 2026). `photo` with `resolution` or `quality` answers `busy` while streaming; `photo` without them captures from the running stream.
 - **Display.** Only Meta Ray-Ban Display has a display. Other glasses answer `unsupported_device`.
 - **Phone audio.** DAT carries no phone audio. `audio_route` uses the glasses as a standard Bluetooth headset (HFP for calls, A2DP for media) through the platform's own audio routing.
 - **Registration cancel.** On Android, DAT's `cancelRegistration()` has no choice to stay out of Meta AI, so `return_to_meta_ai` applies on iOS only.
@@ -308,7 +309,7 @@ Sources: Meta's DAT 1.1.0 changelog for [iOS](https://github.com/meta/meta-weara
 
 ## What needs real glasses
 
-The automated tests cover the routes, parameters and answers on both platforms without glasses, the debug simulator, the display tree rules (the same 24 documents on iOS and Android), the local media server and the clip writer. These still need real glasses paired through Meta AI: a real registration, the camera stream and photos from the glasses, audio from the glasses' microphones, sensor data, "Hey Meta", and a real Meta Ray-Ban Display.
+The automated tests ([TESTING.md](TESTING.md)) cover the routes, parameters and answers on both platforms without glasses, the debug simulator, the display tree rules (the same 24 documents on iOS and Android), the local media server and the clip writer. These still need real glasses paired through Meta AI: a real registration, the camera stream and photos from the glasses, audio from the glasses' microphones, sensor data, "Hey Meta", and a real Meta Ray-Ban Display.
 
 ## License
 

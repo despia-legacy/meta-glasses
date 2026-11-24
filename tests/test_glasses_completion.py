@@ -82,6 +82,15 @@ class AndroidCodecCompletion(unittest.TestCase):
                 print(checked.stdout.strip(), flush=True)
 
 
+# GlassesServer bounds a request head with `queue.asyncAfter(deadline: .now() + 10, ...)`. libdispatch gives
+# asyncAfter a leeway of up to 10% of the delay (_dispatch_after_leeway in libdispatch src/source.c), so the head
+# deadline fires between 10 s and 11 s after accept, later still on a loaded host. The checks below wait for the
+# expiry they assert instead of assuming it happened at a fixed instant.
+HEAD_DEADLINE = 10.0
+HEAD_DEADLINE_LATEST = HEAD_DEADLINE * 1.1
+SCHEDULING_SLACK = 2.0
+
+
 @unittest.skipUnless(platform.system() == "Darwin" and shutil.which("swiftc"), "real macOS Network.framework required")
 class IosRequestLifetime(unittest.TestCase):
     @classmethod
@@ -114,28 +123,39 @@ class IosRequestLifetime(unittest.TestCase):
         return peer
 
     def test_stalled_heads_expire_and_release_every_slot(self):
+        started = time.monotonic()
         for _ in range(8):
             self.connect().sendall(b"GET /")
+        stalled = self.peers[:8]
         time.sleep(0.15)
         refused = self.connect()
         refused.sendall(f"GET /{self.token}/frame.jpg HTTP/1.1\r\n\r\n".encode())
         self.assertIn(b" 503 ", refused.recv(4096))
         time.sleep(5)
-        for peer in self.peers[:8]:
+        for peer in stalled:
+            # Half way through the deadline every stalled head is still open; more bytes do not extend it.
+            peer.setblocking(False)
+            with self.assertRaises(BlockingIOError, msg="stalled request closed before its head deadline"):
+                peer.recv(4096)
+            peer.setblocking(True)
             peer.sendall(b"x")
-        time.sleep(5.5)
+        # The deadline item clears the slot before it cancels the connection, so EOF on all eight means
+        # every slot is free.
+        limit = started + HEAD_DEADLINE_LATEST + SCHEDULING_SLACK
+        for peer in stalled:
+            peer.settimeout(max(0.1, limit - time.monotonic()))
+            self.assertEqual(peer.recv(4096), b"", "stalled request was not cancelled")
         valid = self.connect()
         valid.sendall(f"GET /{self.token}/frame.jpg HTTP/1.1\r\n\r\n".encode())
         self.assertIn(b" 200 ", valid.recv(4096))
-        for peer in self.peers[:8]:
-            self.assertEqual(peer.recv(4096), b"", "stalled request was not cancelled")
 
     def test_complete_live_stream_outlives_header_deadline(self):
         live = self.connect()
         live.sendall(f"GET /{self.token}/live.mjpg HTTP/1.1\r\n\r\n".encode())
         received = live.recv(4096)
         self.assertIn(b" 200 ", received)
-        time.sleep(10.5)
+        # Past the latest instant the head deadline could fire, so a timer left running would have closed it.
+        time.sleep(HEAD_DEADLINE_LATEST + 0.5)
         live.settimeout(0.1)
         try:
             while True:
