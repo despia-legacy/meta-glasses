@@ -30,28 +30,78 @@ final class GlassesDisplay {
         }
     }
 
-    func start(_ s: DeviceSession) -> NativeExtResult {
-        if let d = display { return .ok(["state": Self.state(d.state)]) }
-        if let device = s.device, !device.supportsDisplay() {
-            return .error(code: "unsupported_device", message: "these glasses have no display")
+    private var waiting: [CheckedContinuation<Void, Never>] = []
+    private var outcome: NativeExtResult?
+    private var waitTask: Task<Void, Never>?
+    private var begun = false
+
+    var started: Bool { display?.state == .started }
+
+    /// Answers once the display reports `.started`: Meta's Display guide (DAT 1.1.0, display-access) sends
+    /// content only after the Display capability is started. Answers `display_failed` when the display stops
+    /// before it starts, `timeout` after 20 s.
+    func start(_ s: DeviceSession) async -> NativeExtResult {
+        if display == nil {
+            if let device = s.device, !device.supportsDisplay() {
+                return .error(code: "unsupported_device", message: "these glasses have no display")
+            }
+            let d: Display
+            do {
+                d = try s.addDisplay()
+            } catch {
+                return GlassesErrors.session(error)
+            }
+            let bag = ListenerTokenBag()
+            d.statePublisher.listen { [weak self] st in
+                DispatchQueue.main.async {
+                    MainActor.assumeIsolated {
+                        self?.emit("display", ["state": Self.state(st)])
+                        self?.observe(st)
+                    }
+                }
+            }.store(in: bag)
+            d.onPlaybackEvent = { [weak self] e in
+                DispatchQueue.main.async { MainActor.assumeIsolated { self?.emit("display", Self.playback(e)) } }
+            }
+            display = d
+            tokens = bag
+            begun = false
+            d.start()
         }
-        let d: Display
-        do {
-            d = try s.addDisplay()
-        } catch {
-            return GlassesErrors.session(error)
+        if started { return .ok(["state": "started"]) }
+        if waitTask == nil {
+            waitTask = Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: 20_000_000_000)
+                guard !Task.isCancelled else { return }
+                self?.settle(.error(code: "timeout", message: "the display did not start within 20 s"))
+            }
         }
-        let bag = ListenerTokenBag()
-        d.statePublisher.listen { [weak self] st in
-            DispatchQueue.main.async { MainActor.assumeIsolated { self?.emit("display", ["state": Self.state(st)]) } }
-        }.store(in: bag)
-        d.onPlaybackEvent = { [weak self] e in
-            DispatchQueue.main.async { MainActor.assumeIsolated { self?.emit("display", Self.playback(e)) } }
+        await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in waiting.append(c) }
+        return outcome ?? .error(code: "display_failed", message: "the display did not start")
+    }
+
+    private func observe(_ st: DisplayState) {
+        if st == .starting || st == .started { begun = true }
+        if st == .started {
+            settle(.ok(["state": "started"]))
+        } else if begun, st == .stopped {
+            settle(.error(code: "display_failed", message: "the display stopped before it started"))
         }
-        display = d
-        tokens = bag
-        d.start()
-        return .ok(["state": Self.state(d.state)])
+    }
+
+    private func settle(_ r: NativeExtResult) {
+        waitTask?.cancel()
+        waitTask = nil
+        guard !waiting.isEmpty else { return }
+        outcome = r
+        let w = waiting
+        waiting = []
+        for c in w { c.resume() }
+    }
+
+    private func notStarted() -> NativeExtResult {
+        display == nil ? .error(code: "not_active", message: "start the display first (display_start)")
+            : .error(code: "not_active", message: "the display is not started yet (display_start answers once it is)")
     }
 
     nonisolated static func playback(_ e: VideoPlaybackEvent) -> [String: Any] {
@@ -76,7 +126,7 @@ final class GlassesDisplay {
     }
 
     func send(_ json: String) async -> NativeExtResult {
-        guard let d = display else { return .error(code: "not_active", message: "start the display first (display_start)") }
+        guard let d = display, started else { return notStarted() }
         let tree: GlassesDisplayTree.Node
         do {
             tree = try GlassesDisplayTree.parse(json)
@@ -96,7 +146,7 @@ final class GlassesDisplay {
     }
 
     func video(_ url: String) async -> NativeExtResult {
-        guard let d = display else { return .error(code: "not_active", message: "start the display first (display_start)") }
+        guard let d = display, started else { return notStarted() }
         let player = VideoPlayer(provider: .uri(url), codec: .mp4, onError: { [weak self] e in
             let message = e.description
             DispatchQueue.main.async {
@@ -119,6 +169,7 @@ final class GlassesDisplay {
 
     func clear() async -> NativeExtResult {
         guard let d = display else { return .error(code: "not_active", message: "the display is off") }
+        guard started else { return notStarted() }
         do {
             try await d.clearDisplay()
         } catch {
@@ -129,6 +180,7 @@ final class GlassesDisplay {
 
     func stop(_ s: DeviceSession?) -> NativeExtResult {
         guard let d = display else { return .error(code: "not_active", message: "the display is off") }
+        settle(.error(code: "display_failed", message: "the display was stopped before it started"))
         d.stop()
         tokens?.clear()
         tokens = nil
@@ -138,6 +190,7 @@ final class GlassesDisplay {
 
     func sessionEnded() {
         guard display != nil else { return }
+        settle(.error(code: "session_failed", message: "the glasses session ended before the display started"))
         tokens?.clear()
         tokens = nil
         display = nil

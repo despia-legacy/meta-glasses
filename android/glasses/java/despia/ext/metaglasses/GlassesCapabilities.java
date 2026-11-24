@@ -64,6 +64,7 @@ import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 
+import com.meta.wearable.dat.display.types.DisplayState;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -566,6 +567,9 @@ final class GlassesCapabilities {
         private final Emit emit;
         Display display;
         private CoroutineScope scope;
+        private final List<ExtResult.Callback> waiting = new ArrayList<>();
+        private Runnable waitTimeout;
+        private boolean begun;
         private VideoPlayer player;
         private CoroutineScope playerScope;
 
@@ -577,23 +581,70 @@ final class GlassesCapabilities {
             return display != null;
         }
 
-        ExtResult start(DeviceSession s) {
-            if (display != null) return ExtResult.ok(obj("state", word(display.getState().getValue())));
-            Device d = s.getDeviceInfo().getValue();
-            if (d != null && !d.isDisplayCapable()) return ExtResult.error("unsupported_device", "these glasses have no display");
-            DatResult<Display, DeviceSessionError> r = SessionDisplayExtensionsKt.addDisplay(s, new DisplayConfiguration());
-            if (!r.isSuccess() || r.getOrNull() == null) return session(r.errorOrNull());
-            display = r.getOrNull();
-            scope = DatInterop.mainScope();
-            // CLOSED is Android's end state after STOPPED; the page sees stopped, as on iOS.
-            DatInterop.collect(scope, display.getState(), st -> emit.emit("display", obj("state",
-                    st == com.meta.wearable.dat.display.types.DisplayState.CLOSED ? "stopped" : word(st))));
-            return ExtResult.ok(obj("state", word(display.getState().getValue())));
+        /**
+         * Answers once the display reports STARTED: Meta's Display guide (DAT 1.1.0, display-access) sends content
+         * only after DisplayState.STARTED, and sendContent before it fails ("Invalid display state for operation").
+         * Answers display_failed when the display stops before it starts, timeout after 20 s.
+         */
+        void start(DeviceSession s, ExtResult.Callback reply) {
+            if (display == null) {
+                Device d = s.getDeviceInfo().getValue();
+                if (d != null && !d.isDisplayCapable()) {
+                    reply.reply(ExtResult.error("unsupported_device", "these glasses have no display"));
+                    return;
+                }
+                DatResult<Display, DeviceSessionError> r = SessionDisplayExtensionsKt.addDisplay(s, new DisplayConfiguration());
+                if (!r.isSuccess() || r.getOrNull() == null) {
+                    reply.reply(session(r.errorOrNull()));
+                    return;
+                }
+                display = r.getOrNull();
+                begun = false;
+                scope = DatInterop.mainScope();
+                // CLOSED is Android's end state after STOPPED; the page sees stopped, as on iOS.
+                DatInterop.collect(scope, display.getState(), st -> {
+                    emit.emit("display", obj("state", st == DisplayState.CLOSED ? "stopped" : word(st)));
+                    if (st == DisplayState.STARTING || st == DisplayState.STARTED) begun = true;
+                    if (st == DisplayState.STARTED) settle(ExtResult.ok(obj("state", "started")));
+                    else if (begun && (st == DisplayState.STOPPED || st == DisplayState.CLOSED)) {
+                        settle(ExtResult.error("display_failed", "the display stopped before it started"));
+                    }
+                });
+            }
+            if (started()) {
+                reply.reply(ExtResult.ok(obj("state", "started")));
+                return;
+            }
+            waiting.add(reply);
+            if (waitTimeout == null) {
+                waitTimeout = () -> {
+                    waitTimeout = null;
+                    settle(ExtResult.error("timeout", "the display did not start within 20 s"));
+                };
+                MAIN.postDelayed(waitTimeout, 20000);
+            }
+        }
+
+        boolean started() {
+            return display != null && display.getState().getValue() == DisplayState.STARTED;
+        }
+
+        private void settle(ExtResult r) {
+            if (waitTimeout != null) MAIN.removeCallbacks(waitTimeout);
+            waitTimeout = null;
+            List<ExtResult.Callback> w = new ArrayList<>(waiting);
+            waiting.clear();
+            for (ExtResult.Callback c : w) c.reply(r);
+        }
+
+        private ExtResult notStarted() {
+            return display == null ? ExtResult.error("not_active", "start the display first (display_start)")
+                    : ExtResult.error("not_active", "the display is not started yet (display_start answers once it is)");
         }
 
         void send(String json, ExtResult.Callback reply) {
-            if (display == null) {
-                reply.reply(ExtResult.error("not_active", "start the display first (display_start)"));
+            if (!started()) {
+                reply.reply(notStarted());
                 return;
             }
             GlassesCore.DisplayTree.Node tree;
@@ -615,8 +666,8 @@ final class GlassesCapabilities {
         }
 
         void video(String url, ExtResult.Callback reply) {
-            if (display == null) {
-                reply.reply(ExtResult.error("not_active", "start the display first (display_start)"));
+            if (!started()) {
+                reply.reply(notStarted());
                 return;
             }
             closePlayer();
@@ -663,12 +714,17 @@ final class GlassesCapabilities {
                 reply.reply(ExtResult.error("not_active", "the display is off"));
                 return;
             }
+            if (!started()) {
+                reply.reply(notStarted());
+                return;
+            }
             Display d = display;
             DatInterop.<DatResult<Boolean, DisplayError>>call(d::clearDisplay, (r, error) -> reply.reply(displayResult(r, error, obj("cleared", true))));
         }
 
         ExtResult stop(DeviceSession s) {
             if (display == null) return ExtResult.error("not_active", "the display is off");
+            settle(ExtResult.error("display_failed", "the display was stopped before it started"));
             closePlayer();
             display.stop();
             if (s != null) SessionDisplayExtensionsKt.removeDisplay(s);
@@ -680,6 +736,7 @@ final class GlassesCapabilities {
 
         void sessionEnded() {
             if (display == null) return;
+            settle(ExtResult.error("session_failed", "the glasses session ended before the display started"));
             closePlayer();
             DatInterop.cancel(scope);
             scope = null;

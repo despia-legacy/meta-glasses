@@ -550,7 +550,10 @@ final class GlassesController {
         case "speech_start": r = sensors.speechStart(s)
         case "motion_start": r = sensors.motionStart(s, rate: Int(call.params["rate"] as? String ?? "10") ?? 10)
         case "inputs_start": r = sensors.inputsStart(s, sources: call.params["sources"] as? String, consumeBack: call.params["consume_back"] as? Bool ?? true)
-        default: r = display.start(s)
+        default:
+            // Answers when the display is started (or failed); a failed start leaves no display behind.
+            r = await display.start(s)
+            if case .error = r, display.active, !display.started { _ = display.stop(session) }
         }
         if case .error = r { releaseSessionIfIdle() }
         return r

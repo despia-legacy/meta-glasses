@@ -910,7 +910,13 @@ public final class GlassesExtension implements NativeExtension {
                     r = sensors.inputsStart(s, str(call, "sources"), !Boolean.FALSE.equals(call.params.get("consume_back")));
                     break;
                 default:
-                    r = screen.start(s);
+                    // Answers when the display is started (or failed); a failed start leaves no display behind.
+                    screen.start(s, res -> {
+                        if (!res.isOk() && screen.active() && !screen.started()) screen.stop(session);
+                        if (!res.isOk()) releaseSessionIfIdle();
+                        reply.reply(res);
+                    });
+                    return;
             }
             if (!r.isOk()) releaseSessionIfIdle();
             reply.reply(r);
