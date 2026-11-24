@@ -278,9 +278,14 @@ final class GlassesController {
         return o
     }
 
-    private func emitState(_ reason: String) {
+    /// The state event; when the stream ended with an error, its code and message too.
+    private func emitState(_ reason: String, error: NativeExtResult? = nil) {
         var o = status()
         o["reason"] = reason
+        if case .error(let code, let message) = error {
+            o["error"] = code
+            o["message"] = message
+        }
         context.emit("state", o)
     }
 
@@ -726,16 +731,16 @@ final class GlassesController {
             startError = error
             teardown("start_failed")
         } else {
-            ended(g, reason)
+            ended(g, reason, error: error)
         }
     }
 
     /// The SDK ended generation g by itself.
-    private func ended(_ g: Int64, _ reason: String) {
+    private func ended(_ g: Int64, _ reason: String, error: NativeExtResult? = nil) {
         guard let clip = core.ended(g) else { return }
         stopSDK()
         if !clip.isEmpty { Task { _ = await self.finishClip(clip, reason: reason) } }
-        emitState(reason)
+        emitState(reason, error: error)
     }
 
     /// An explicit stop (route, failed start, mock off): later SDK callbacks are stale.

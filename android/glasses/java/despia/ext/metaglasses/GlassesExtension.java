@@ -519,9 +519,18 @@ public final class GlassesExtension implements NativeExtension {
     }
 
     private void emitState(String reason) {
+        emitState(reason, null);
+    }
+
+    /** The state event; when the stream ended with an error, its code and message too. */
+    private void emitState(String reason, ExtResult error) {
         try {
             JSONObject o = status();
             o.put("reason", reason == null ? JSONObject.NULL : reason);
+            if (error != null && !error.isOk()) {
+                o.put("error", error.code());
+                o.put("message", error.message());
+            }
             ctx.emit("state", o);
         } catch (JSONException ignored) {
             // status() builds from plain values.
@@ -1133,7 +1142,7 @@ public final class GlassesExtension implements NativeExtension {
         if (starting != null && starting.gen == g) {
             failStart(starting, error);
         } else {
-            ended(g, reason);
+            ended(g, reason, error);
         }
     }
 
@@ -1147,6 +1156,10 @@ public final class GlassesExtension implements NativeExtension {
 
     /** The SDK ended generation g by itself. */
     private void ended(long g, String reason) {
+        ended(g, reason, null);
+    }
+
+    private void ended(long g, String reason, ExtResult error) {
         String clip = core.ended(g);
         if (clip == null) return;
         stopSdk();
@@ -1157,7 +1170,7 @@ public final class GlassesExtension implements NativeExtension {
             s.reply.reply(ExtResult.error("no_device", "the stream ended before it started"));
         }
         if (!clip.isEmpty()) finishClip(clip, reason, null);
-        emitState(reason);
+        emitState(reason, error);
     }
 
     /** An explicit stop (route, failed start or mock off): later SDK callbacks are stale. */

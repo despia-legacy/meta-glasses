@@ -16,7 +16,9 @@ enum GlassesMedia {
     static let mockWidth = 504
     static let mockHeight = 896
     static let mockFPS: Int32 = 24
-    static let mockFrames = 72
+    /// 30 s: on the simulator (24 Nov) DAT 1.1.0's iOS mock ended a stream with a stream error about
+    /// 6 s into a 3 s feed; a feed longer than any test stream keeps the mock from reaching that.
+    static let mockFrames = 720
 
     /// Writes data next to url and moves it into place, so a reader never sees half a file.
     static func write(_ data: Data, to url: URL) throws {

@@ -231,7 +231,7 @@ Each route answers once in its own callback, listed in the tables below. Routes 
 
 | Event | Callback | Scope | When |
 | --- | --- | --- | --- |
-| `state` | `onGlassesState` | `document` | The stream state changed |
+| `state` | `onGlassesState` | `document` | The stream state changed: the state object (as `status` answers) with `reason`; when the stream ended with an error, also `error` (the code, as the routes answer it) and `message` |
 | `media` | `onGlassesMedia` | `document` | A photo or clip finished, or failed |
 | `registration` | `onGlassesRegistration` | `document` | The Meta AI app answered the registration |
 | `registration_request` | `onGlassesRegistrationRequest` | `document` | Meta AI started a registration: `flowId`, `protocolVersion`. Answer with `registration_continue` or `registration_cancel` |
