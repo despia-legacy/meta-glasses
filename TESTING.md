@@ -10,6 +10,7 @@ python3 -m unittest discover -s tests -v
 
 - `tests/test_glasses_parity.py` runs the same 24 display view tree documents (`tests/metaglasses/display/display-vectors.json`) through the Swift and the Java parser and expects identical answers. It also checks that every route, parameter and event in `manifest.json` is handled on both platforms.
 - `tests/test_glasses_completion.py` checks the local media server's request lifetime on macOS Network.framework, the Android clip writer's codec and muxer completion against the real `android.jar`, and that release builds refuse the mock routes before the SDK starts.
+- `tests/test_glasses_clip.py` compiles the iOS clip writer (`GlassesClipWriter`) for macOS and records decoded frames into a finished MP4, as `record_start` does on a stream.
 
 Requirements: a JDK 17 or later for the Java checks, `swiftc` on macOS for the Swift checks, and an Android SDK with platform 36 (`ANDROID_HOME`, `ANDROID_SDK_ROOT` or `DESPIA_NX_ANDROID_JAR`). A check whose tool is missing is reported as skipped, not passed.
 
@@ -31,6 +32,8 @@ The `mock` route turns on DAT's mock device kit in debug builds; release builds 
 ### iOS and Android: from a page
 
 Serve a page in a debug build that calls the routes in the order above with the Despia JS SDK (see the README's "Using it from your web app"), and check each answer's `ok` and `code`. On iOS, use a simulator with iOS 17.2 or later.
+
+On the iOS simulator (DAT 1.1.0 mock, Mini simulator iOS 26.5, 25 Nov 2026) a stream started with `audio: true` ended about 6 seconds in with DAT's stream `timeout` error (the state event carries `error: timeout`), while the same flow with `audio: false` streams, takes stream photos and records clips; the Android mock streams with audio. Camera audio on iOS is therefore proven on real glasses (section 3), not on the simulator.
 
 ## 3. Real glasses (not automated)
 

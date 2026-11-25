@@ -208,6 +208,9 @@ final class GlassesClipWriter {
             return false
         }
         writer.add(input)
+        // AVFoundation refuses (NSInvalidArgumentException, the app ends) an adaptor made for an input that has
+        // already started writing, so it is made before startWriting.
+        let adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: input, sourcePixelBufferAttributes: nil)
         if let audioRate {
             let a = AVAssetWriterInput(mediaType: .audio, outputSettings: [
                 AVFormatIDKey: kAudioFormatMPEG4AAC, AVSampleRateKey: audioRate, AVNumberOfChannelsKey: audioChannels,
@@ -225,7 +228,7 @@ final class GlassesClipWriter {
         }
         self.writer = writer
         self.input = input
-        adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: input, sourcePixelBufferAttributes: nil)
+        self.adaptor = adaptor
         return true
     }
 
